@@ -252,11 +252,18 @@ def search_doaj(query, max_results=5):
         return []
 
 
-def search_semanticscholar(query, max_results=5):
-    """Semantic Scholar — 200M+ работ, без ключа (аноним. доступ ограничен по скорости,
-    но для демо этого достаточно). Используется вместо OpenAlex: у OpenAlex стабильно
-    возникали ошибки доступа (403/429) при запросах с IP облачных хостингов
-    (например, Streamlit Cloud), поэтому он исключён из активных источников."""
+def search_semanticscholar(query, max_results=5, api_key=""):
+    """Semantic Scholar — 200M+ работ. Используется вместо OpenAlex: у OpenAlex стабильно
+    возникали ошибки доступа (403/429) при запросах с IP облачных хостингов.
+
+    ВАЖНО про 429: без ключа запрос идёт в ОБЩИЙ анонимный пул лимитов Semantic
+    Scholar, который делят между собой ВСЕ бесключевые обращения к API в мире —
+    включая другие приложения, размещённые на том же облачном хостинге (например,
+    Streamlit Community Cloud раздаёт IP из общего набора на тысячи чужих приложений).
+    429 может прилетать из-за чужого трафика, а не из-за количества ваших запросов.
+    Бесплатный личный ключ (https://www.semanticscholar.org/product/api#api-key)
+    даёт отдельный, куда более щедрый лимит — рекомендуется, если 429 повторяются."""
+    headers = {"x-api-key": api_key.strip()} if api_key.strip() else {}
     try:
         r = _get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
@@ -264,6 +271,7 @@ def search_semanticscholar(query, max_results=5):
                 "query": query, "limit": max_results,
                 "fields": "title,year,authors,abstract,externalIds,venue,url",
             },
+            headers=headers,
             timeout=20,
         )
         r.raise_for_status()
@@ -779,22 +787,44 @@ with st.sidebar:
         "Выберите базы", list(SOURCES.keys()),
         default=["PubMed / NCBI (медицина, химия, биология)",
                  "Semantic Scholar (200M+ работ)",
-                 "Crossref (метаданные DOI + Unpaywall)"],
+                 "Crossref (метаданные DOI + Unpaywall)",
+                 "Europe PMC (PMC + Европейская коллекция)"],
     )
     per_source = st.slider("Источников на каждую базу", 2, 10, 4)
     check_oa = st.checkbox(
         "Проверять открытый доступ (Unpaywall) для найденных DOI", value=True,
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
     )
+    semantic_scholar_key = st.text_input(
+        "API-ключ Semantic Scholar (необязательно)", type="password",
+        help="Без ключа запрос идёт в общий анонимный пул лимитов, который делят "
+             "все бесключевые запросы к Semantic Scholar в мире — на нём часто "
+             "ловится 429 из-за чужого трафика, особенно с общих IP облачных "
+             "хостингов. Бесплатный личный ключ снимает эту проблему. Форма: "
+             "semanticscholar.org/product/api#api-key-form (ключ приходит на "
+             "почту, иногда через несколько дней).",
+    )
 
     st.divider()
     st.subheader("Патентные базы (опционально)")
     st.caption(
-        "У обеих баз нет полностью бесплатного анонимного доступа: PatentsView "
-        "требует бесплатный API-ключ (старый доступ без ключа отключён), "
-        "EPO OPS/Espacenet требует бесплатную регистрацию Consumer Key/Secret. "
-        "WIPO PATENTSCOPE не предлагает публичного API и поэтому здесь не используется."
+        "У обеих баз нет полностью бесплатного анонимного доступа (проверено — "
+        "полностью открытого API патентов сейчас не существует). "
+        "**EPO OPS/Espacenet (рекомендуется)**: developers.epo.org/user/register → "
+        "доступ 'Non-paying' → подтвердить email → 'My Apps' → 'Add a new App' → "
+        "получите Consumer Key/Secret (~5 минут, 3.5 ГБ/неделю бесплатно). "
+        "**PatentsView**: форма на ключ по ссылке ниже, но по свежим отчётам их "
+        "сервис поддержки и сам API нестабильны — используйте как резервный, не единственный."
     )
+    PATENT_CRED_HELP = {
+        "epo_consumer_key": "developers.epo.org/user/register → 'Non-paying' → "
+                             "подтвердить email → 'My Apps' → 'Add a new App'.",
+        "epo_consumer_secret": "Выдаётся в той же карточке приложения, что и Consumer Key "
+                                "(вкладка 'Keys' в 'My Apps').",
+        "patentsview_api_key": "patentsview-support.atlassian.net/servicedesk/customer/"
+                                "portal/1/create/18 — форма 'Request a PatentSearch API Key'. "
+                                "Сервис нестабилен, используйте как резервный вариант.",
+    }
     selected_patent_sources = st.multiselect(
         "Выберите патентные базы", list(PATENT_SOURCES.keys()), default=[]
     )
@@ -803,7 +833,8 @@ with st.sidebar:
         _fn, cred_fields = PATENT_SOURCES[name]
         for label, storage_key, _kwarg_name in cred_fields:
             patent_credentials[storage_key] = st.text_input(
-                f"{label} — {name}", type="password", key=f"patcred_{storage_key}"
+                f"{label} — {name}", type="password", key=f"patcred_{storage_key}",
+                help=PATENT_CRED_HELP.get(storage_key),
             )
 
 
@@ -847,10 +878,14 @@ with tab1:
         all_items = []
         total_steps = len(selected_sources) + len(selected_patent_sources)
         progress = st.progress(0.0, text="Поиск источников…")
+        SS_NAME = "Semantic Scholar (200M+ работ)"
         for i, name in enumerate(selected_sources):
             progress.progress(i / max(total_steps, 1), text=f"Ищу в {name}…")
             if name in SOURCES:
-                found = SOURCES[name](topic, per_source)
+                if name == SS_NAME:
+                    found = SOURCES[name](topic, per_source, api_key=semantic_scholar_key)
+                else:
+                    found = SOURCES[name](topic, per_source)
                 all_items.extend(found)
 
         for j, name in enumerate(selected_patent_sources):
@@ -867,6 +902,23 @@ with tab1:
                 st.warning(error)
             all_items.extend(found)
         progress.progress(1.0, text="Поиск завершён")
+
+        # Фолбэк: если выбранные источники ничего не дали (например, все словили
+        # 429/сбой одновременно) — автоматически пробуем остальные бесплатные базы,
+        # прежде чем сдаваться. Так временный сбой одного API не обнуляет весь обзор.
+        if not all_items:
+            remaining = [n for n in SOURCES if n not in selected_sources]
+            if remaining:
+                st.info(
+                    "Выбранные базы не вернули результатов (возможно, временный сбой "
+                    "или лимит запросов). Пробую остальные бесплатные базы автоматически…"
+                )
+                for name in remaining:
+                    if name == SS_NAME:
+                        found = SOURCES[name](topic, per_source, api_key=semantic_scholar_key)
+                    else:
+                        found = SOURCES[name](topic, per_source)
+                    all_items.extend(found)
 
         if check_oa:
             with st.spinner("Проверяю открытый доступ по DOI (Unpaywall)…"):
