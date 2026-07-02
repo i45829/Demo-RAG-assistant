@@ -1,5 +1,26 @@
+"""
+app.py — Демо-система «Литературный обзор по теме» для презентации руководству.
+
+ЧТО ДЕЛАЕТ:
+  1. Пользователь вводит тему в браузере (никакой установки — просто веб-страница).
+  2. Приложение ищет источники через бесплатные научные API (OpenAlex, arXiv,
+     Europe PMC, DOAJ, Crossref + Unpaywall для платных статей).
+  3. Собранные данные передаются в LLM (Claude или Gemini — на выбор), которая
+     синтезирует обзор литературы с нумерованными ссылками [n].
+  4. Результат показывается в браузере и скачивается как .docx.
+
+ЗАПУСК ЛОКАЛЬНО (для проверки перед деплоем, не обязателен для демо):
+  pip install streamlit httpx python-docx
+  streamlit run app.py
+
+ДЕПЛОЙ (бесплатно, без установки на ПК начальства) — см. файл
+deploy_streamlit_cloud.md в комплекте.
+"""
+
 import io
 import os
+import base64
+import json
 from datetime import date
 
 import httpx
@@ -206,6 +227,161 @@ def check_unpaywall(doi):
         return None
 
 
+# ============================== ПАТЕНТНЫЕ БАЗЫ (нужны свои ключи) ==============================
+# Каждая функция возвращает (items, error) — error=None при успехе, иначе строка с
+# понятным описанием проблемы (модель показывает её пользователю, а не падает).
+
+
+def _epo_ops_token(client_key, client_secret):
+    basic = base64.b64encode(f"{client_key}:{client_secret}".encode()).decode()
+    r = httpx.post(
+        "https://ops.epo.org/3.2/auth/accesstoken",
+        headers={"Authorization": f"Basic {basic}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "client_credentials"}, timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def search_epo_ops(query, max_results, client_key, client_secret):
+    """Espacenet (данные EPO) через официальный Open Patent Services API.
+    Бесплатная регистрация: developers.epo.org → My Apps → Consumer Key/Secret."""
+    if not client_key or not client_secret:
+        return [], "Espacenet (EPO OPS): не указан ключ/секрет — источник пропущен."
+    try:
+        token = _epo_ops_token(client_key, client_secret)
+    except Exception as exc:
+        return [], f"Espacenet (EPO OPS): ошибка авторизации ({exc})"
+    cql = query if "=" in query else f'ti="{query}" or ab="{query}"'
+    try:
+        r = httpx.get(
+            "https://ops.epo.org/3.2/rest-services/published-data/search/biblio",
+            params={"q": cql, "Range": f"1-{max_results}"},
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        return [], f"Espacenet (EPO OPS): ошибка запроса ({exc})"
+
+    items = []
+    try:
+        biblio = (data.get("ops:world-patent-data") or {}).get("ops:biblio-search") or {}
+        docs = (biblio.get("ops:search-result") or {}).get("ops:publication-reference", [])
+        if isinstance(docs, dict):
+            docs = [docs]
+        for d in docs[:max_results]:
+            did = d.get("document-id", {})
+            country = (did.get("country") or {}).get("$", "")
+            num = (did.get("doc-number") or {}).get("$", "")
+            kind = (did.get("kind") or {}).get("$", "")
+            pn = f"{country}{num}{kind}"
+            items.append({
+                "title": f"Патент {pn}",
+                "authors": "н/д",
+                "year": "н/д",
+                "source": "Espacenet (EPO OPS)",
+                "url": f"https://worldwide.espacenet.com/patent/search?q=pn%3D{country}{num}",
+                "doi": "",
+                "abstract": "",
+            })
+    except Exception as exc:
+        return [], f"Espacenet (EPO OPS): не удалось разобрать ответ ({exc})"
+    return items, None
+
+
+def search_patentsview(query, max_results, api_key):
+    """USPTO PatentsView — патенты США. Бесплатный ключ: заявка через форму
+    PatentsView Support Portal (search.patentsview.org)."""
+    if not api_key:
+        return [], "USPTO PatentsView: не указан ключ — источник пропущен."
+    try:
+        q = {"_text_any": {"patent_title": query}}
+        f = ["patent_id", "patent_title", "patent_date"]
+        o = {"size": max_results}
+        r = httpx.get(
+            "https://search.patentsview.org/api/v1/patent/",
+            params={"q": json.dumps(q), "f": json.dumps(f), "o": json.dumps(o)},
+            headers={"X-Api-Key": api_key}, timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        return [], f"USPTO PatentsView: ошибка запроса ({exc})"
+
+    items = []
+    for p in (data.get("patents") or [])[:max_results]:
+        pid = p.get("patent_id", "")
+        items.append({
+            "title": p.get("patent_title") or f"Патент US{pid}",
+            "authors": "н/д",
+            "year": (p.get("patent_date") or "н/д")[:4],
+            "source": "USPTO PatentsView",
+            "url": f"https://worldwide.espacenet.com/patent/search?q=pn%3DUS{pid}",
+            "doi": "",
+            "abstract": "",
+        })
+    return items, None
+
+
+def search_lens_patents(query, max_results, token):
+    """Lens.org — глобальная патентная база (100+ ведомств: USPTO, EPO, WIPO и др.).
+    Бесплатный доступ (научные/некоммерческие цели) — заявка на lens.org/lens/user/subscriptions,
+    токен выдаётся не мгновенно, в отличие от остальных источников."""
+    if not token:
+        return [], "Lens.org: не указан токен — источник пропущен."
+    try:
+        r = httpx.post(
+            "https://api.lens.org/patent/search",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"query": query, "size": max_results, "include": ["biblio", "lens_id"]},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        return [], f"Lens.org: ошибка запроса ({exc})"
+
+    items = []
+    for d in (data.get("data") or [])[:max_results]:
+        biblio = d.get("biblio") or {}
+        title_field = biblio.get("invention_title")
+        if isinstance(title_field, list):
+            title = (title_field[0] or {}).get("text") if title_field else None
+        else:
+            title = title_field
+        lens_id = d.get("lens_id", "")
+        items.append({
+            "title": title or f"Патент {lens_id}",
+            "authors": "н/д",
+            "year": "н/д",
+            "source": "Lens.org",
+            "url": f"https://www.lens.org/lens/patent/{lens_id}" if lens_id else "",
+            "doi": "",
+            "abstract": "",
+        })
+    return items, None
+
+
+# name -> (функция, список (метка поля, session_key) для нужных реквизитов)
+PATENT_SOURCES = {
+    "Espacenet / EPO OPS (патенты, бесплатный ключ)": (
+        search_epo_ops,
+        [("Consumer Key (EPO)", "epo_key"), ("Consumer Secret (EPO)", "epo_secret")],
+    ),
+    "USPTO PatentsView (патенты США, бесплатный ключ)": (
+        search_patentsview,
+        [("API-ключ PatentsView", "patentsview_key")],
+    ),
+    "Lens.org (патенты, 100+ ведомств, токен по заявке)": (
+        search_lens_patents,
+        [("Access Token (Lens.org)", "lens_token")],
+    ),
+}
+
+
 SOURCES = {
     "OpenAlex (научные работы)": search_openalex,
     "arXiv (препринты)": search_arxiv,
@@ -252,13 +428,14 @@ def build_user_message(topic, items):
     return "\n".join(lines)
 
 
-def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash"):
+def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash", temperature=0.3):
     r = httpx.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         params={"key": api_key},
         json={
             "system_instruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+            "generationConfig": {"temperature": temperature},
         },
         timeout=120,
     )
@@ -267,7 +444,7 @@ def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash"):
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def call_polza(system_prompt, user_message, api_key, model):
+def call_polza(system_prompt, user_message, api_key, model, temperature=0.3):
     """Polza.ai — агрегатор моделей с OpenAI-совместимым API.
     Формат model: 'provider/model', например 'openai/gpt-4o', 'anthropic/claude-3.7-sonnet'."""
     r = httpx.post(
@@ -275,6 +452,7 @@ def call_polza(system_prompt, user_message, api_key, model):
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": model,
+            "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
@@ -287,10 +465,10 @@ def call_polza(system_prompt, user_message, api_key, model):
     return data["choices"][0]["message"]["content"]
 
 
-def call_llm(provider, model_id, system_prompt, user_message, api_key):
+def call_llm(provider, model_id, system_prompt, user_message, api_key, temperature=0.3):
     if provider == "Google Gemini":
-        return call_gemini(system_prompt, user_message, api_key, model=model_id)
-    return call_polza(system_prompt, user_message, api_key, model=model_id)
+        return call_gemini(system_prompt, user_message, api_key, model=model_id, temperature=temperature)
+    return call_polza(system_prompt, user_message, api_key, model=model_id, temperature=temperature)
 
 
 # ------------------------- Загрузка списка доступных моделей -------------------------
@@ -411,8 +589,9 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Источники для поиска")
+    all_source_names = list(SOURCES.keys()) + list(PATENT_SOURCES.keys())
     selected_sources = st.multiselect(
-        "Выберите базы", list(SOURCES.keys()), default=list(SOURCES.keys())[:3]
+        "Выберите базы", all_source_names, default=list(SOURCES.keys())[:3]
     )
     per_source = st.slider("Источников на каждую базу", 2, 10, 4)
     check_oa = st.checkbox(
@@ -420,70 +599,135 @@ with st.sidebar:
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
     )
 
-topic = st.text_area(
-    "Тема литературного обзора",
-    placeholder="Например: Барьеры перехода на электромобили в Европе (2023–2025): "
-                "инфраструктура, цена, меры господдержки",
-    height=100,
-)
+    selected_patent_sources = [s for s in selected_sources if s in PATENT_SOURCES]
+    patent_credentials = {}  # {название базы: {session_key: значение}}
+    if selected_patent_sources:
+        st.divider()
+        st.subheader("Ключи патентных API")
+        st.caption(
+            "Для каждой выбранной патентной базы нужен свой бесплатный ключ. "
+            "Без ключа источник будет пропущен при формировании обзора."
+        )
+        for name in selected_patent_sources:
+            _, cred_fields = PATENT_SOURCES[name]
+            with st.expander(name, expanded=True):
+                values = {}
+                for field_label, session_key in cred_fields:
+                    values[session_key] = st.text_input(
+                        field_label, type="password", key=f"cred_{session_key}"
+                    )
+                patent_credentials[name] = values
 
-go = st.button(
-    "🔎 Сформировать обзор", type="primary",
-    disabled=not (topic and api_key and model_id and selected_sources),
-)
 
-if not api_key:
-    st.info("Введите API-ключ в боковой панели, чтобы начать.")
-elif not model_id:
-    st.info("Выберите модель в боковой панели, чтобы начать.")
+tab1, tab2 = st.tabs(["📚 Обзор", "⚙️ Настройка промта"])
 
-if go:
-    all_items = []
-    progress = st.progress(0.0, text="Поиск источников…")
-    for i, name in enumerate(selected_sources):
-        progress.progress((i) / len(selected_sources), text=f"Ищу в {name}…")
-        found = SOURCES[name](topic, per_source)
-        all_items.extend(found)
-    progress.progress(1.0, text="Поиск завершён")
-
-    if check_oa:
-        with st.spinner("Проверяю открытый доступ по DOI (Unpaywall)…"):
-            for it in all_items:
-                if it.get("doi"):
-                    oa_url = check_unpaywall(it["doi"])
-                    if oa_url:
-                        it["url"] = oa_url
-                        it["source"] += " [открытая копия найдена]"
-
-    if not all_items:
-        st.error("Ничего не найдено. Попробуйте переформулировать тему или выбрать другие источники.")
-        st.stop()
-
-    with st.expander(f"📎 Найдено источников: {len(all_items)} (нажмите, чтобы посмотреть)"):
-        for i, it in enumerate(all_items, 1):
-            st.markdown(f"**[{i}] {it['title']}** ({it['year']}) — *{it['source']}*  \n{it['url']}")
-
-    with st.spinner("ИИ формирует обзор литературы…"):
-        user_msg = build_user_message(topic, all_items)
-        try:
-            review = call_llm(provider, model_id, REVIEW_SYSTEM_PROMPT, user_msg, api_key)
-        except Exception as exc:
-            st.error(f"Ошибка обращения к модели: {exc}")
-            st.stop()
-
-    st.success("Обзор готов!")
-    st.markdown(review)
-
-    docx_buf = build_docx(topic, review)
-    st.download_button(
-        "⬇️ Скачать как Word (.docx)",
-        data=docx_buf,
-        file_name=f"literature_review_{date.today().isoformat()}.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+with tab1:
+    temperature = st.slider(
+        "Температура ответа", min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+        help="Ниже (0.0–0.3) — более точный, предсказуемый, "
+             "\"academic\" ответ. Выше (0.7–1.0) — больше вариативности и "
+             "\"творчества\", но выше риск неточностей."
     )
 
-st.divider()
-st.caption(
-    "Демо-версия. Источники: OpenAlex, arXiv, Europe PMC, DOAJ, Crossref (+ Unpaywall). "
-    "Полный список используемых баз и логика проверки цитирования — в промт-шаблоне проекта."
-)
+    topic = st.text_area(
+        "Тема литературного обзора",
+        placeholder="Например: Барьеры перехода на электромобили в Европе (2023–2025): "
+                    "инфраструктура, цена, меры господдержки",
+        height=100,
+    )
+
+    go = st.button(
+        "🔎 Сформировать обзор", type="primary",
+        disabled=not (topic and api_key and model_id and selected_sources),
+    )
+
+    if not api_key:
+        st.info("Введите API-ключ в боковой панели, чтобы начать.")
+    elif not model_id:
+        st.info("Выберите модель в боковой панели, чтобы начать.")
+
+    if go:
+        all_items = []
+        progress = st.progress(0.0, text="Поиск источников…")
+        for i, name in enumerate(selected_sources):
+            progress.progress((i) / len(selected_sources), text=f"Ищу в {name}…")
+            if name in SOURCES:
+                found = SOURCES[name](topic, per_source)
+                all_items.extend(found)
+            elif name in PATENT_SOURCES:
+                fn, cred_fields = PATENT_SOURCES[name]
+                creds = patent_credentials.get(name, {})
+                args = [creds.get(session_key) for _, session_key in cred_fields]
+                found, err = fn(topic, per_source, *args)
+                if err:
+                    st.warning(err)
+                all_items.extend(found)
+        progress.progress(1.0, text="Поиск завершён")
+
+        if check_oa:
+            with st.spinner("Проверяю открытый доступ по DOI (Unpaywall)…"):
+                for it in all_items:
+                    if it.get("doi"):
+                        oa_url = check_unpaywall(it["doi"])
+                        if oa_url:
+                            it["url"] = oa_url
+                            it["source"] += " [открытая копия найдена]"
+
+        if not all_items:
+            st.error("Ничего не найдено. Попробуйте переформулировать тему или выбрать другие источники.")
+            st.stop()
+
+        with st.expander(f"📎 Найдено источников: {len(all_items)} (нажмите, чтобы посмотреть)"):
+            for i, it in enumerate(all_items, 1):
+                st.markdown(f"**[{i}] {it['title']}** ({it['year']}) — *{it['source']}*  \n{it['url']}")
+
+        with st.spinner("ИИ формирует обзор литературы…"):
+            user_msg = build_user_message(topic, all_items)
+            try:
+                active_prompt = st.session_state.get("system_prompt", REVIEW_SYSTEM_PROMPT)
+                review = call_llm(provider, model_id, active_prompt, user_msg, api_key, temperature=temperature)
+            except Exception as exc:
+                st.error(f"Ошибка обращения к модели: {exc}")
+                st.stop()
+
+        st.success("Обзор готов!")
+        st.markdown(review)
+
+        docx_buf = build_docx(topic, review)
+        st.download_button(
+            "⬇️ Скачать как Word (.docx)",
+            data=docx_buf,
+            file_name=f"literature_review_{date.today().isoformat()}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+    st.divider()
+    st.caption(
+        "Демо-версия. Источники: OpenAlex, arXiv, Europe PMC, DOAJ, Crossref (+ Unpaywall). "
+        "Полный список используемых баз и логика проверки цитирования — в промт-шаблоне проекта."
+    )
+
+with tab2:
+    st.subheader("Системный промт для генерации обзора")
+    st.caption(
+        "Здесь задаётся инструкция, по которой модель формирует обзор литературы. "
+        "Можно скорректировать структуру, стиль, требования к цитированию и т.д."
+    )
+
+    if "system_prompt" not in st.session_state:
+        st.session_state["system_prompt"] = REVIEW_SYSTEM_PROMPT
+
+    edited_prompt = st.text_area(
+        "Промт", value=st.session_state["system_prompt"], height=500,
+        key="prompt_editor",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💾 Сохранить промт"):
+            st.session_state["system_prompt"] = edited_prompt
+            st.success("Промт сохранён и будет использован при следующей генерации.")
+    with col2:
+        if st.button("↩️ Сбросить к варианту по умолчанию"):
+            st.session_state["system_prompt"] = REVIEW_SYSTEM_PROMPT
+            st.rerun()
