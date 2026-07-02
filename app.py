@@ -548,7 +548,13 @@ REVIEW_SYSTEM_PROMPT = """Ты — научный аналитик, готовя
 - Рекомендации (явно как предположение)
 
 ## Список литературы
-[n] Авторы. Название. Год. Источник. URL."""
+[n] Авторы. Название. Год. Источник. URL.
+
+ЯЗЫК ОБЗОРА И ИСТОЧНИКОВ:
+- Тело обзора (Введение, Обзор литературы, Выводы) пишется ТОЛЬКО на русском языке, независимо от языка источников.
+- Аннотации источников могут быть на английском или другом языке — извлекай факты и передавай их по-русски своими словами. Не оставляй фрагменты на английском в тексте обзора.
+- Специальные термины, названия веществ/методов/приборов и химические формулы сохраняй как в источнике (например, «гидроксипропилметилцеллюлоза (HPMC K15M)», «CH3COONa», «EC50 = 0.3 мкМ»).
+- В «Списке литературы» название статьи оставляй на языке оригинала — не переводи. Авторы, год, источник, URL — как есть."""
 
 
 def build_user_message(topic, items):
@@ -653,6 +659,78 @@ def call_llm(provider, model_id, system_prompt, user_message, api_key, temperatu
     if provider == "Google Gemini":
         return call_gemini(system_prompt, user_message, api_key, model=model_id, temperature=temperature)
     return call_polza(system_prompt, user_message, api_key, model=model_id, temperature=temperature)
+
+
+# ============================== ДВУЯЗЫЧНЫЙ ПОИСК ==============================
+
+TRANSLATE_SYSTEM_PROMPT = """Ты переводишь научные темы поиска с любого языка на английский.
+Задача: получить 1–2 англоязычных поисковых запроса, которые будут релевантны научным
+базам (PubMed, Crossref, Semantic Scholar). Правила:
+- Используй устоявшуюся англоязычную научную терминологию, а не дословный перевод.
+- НЕ добавляй кавычки, операторы AND/OR, комментарии, объяснения.
+- НЕ пиши преамбулы вроде "Here are the queries".
+- Верни строго JSON-массив строк. Пример: ["oil dispersions plant protection", "adjuvant oil emulsion pesticide formulation"]
+- Если тема уже на английском — верни массив с 1–2 уточнёнными формулировками той же темы."""
+
+
+def translate_topic_to_english(topic, provider, model_id, api_key):
+    """Переводит тему на английский с помощью той же LLM. Возвращает список из 1–2 англ. вариантов
+    (или пустой список, если что-то пошло не так — тогда двуязычный поиск просто не выполнится,
+    но обычный русский поиск остаётся). Использует temperature=0 для стабильности перевода."""
+    try:
+        raw = call_llm(provider, model_id, TRANSLATE_SYSTEM_PROMPT,
+                       f"Тема: {topic}", api_key, temperature=0.0)
+        raw = raw.strip()
+        # Модели иногда оборачивают JSON в ```json ... ``` — снимаем
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].lstrip()
+        # Ищем первый массив в тексте (на случай, если модель добавила преамбулу)
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        arr = json.loads(raw[start:end + 1])
+        if not isinstance(arr, list):
+            return []
+        # Оставляем только непустые строки, до 2 запросов, отличающиеся от исходной темы
+        cleaned = []
+        for q in arr:
+            if isinstance(q, str):
+                q = q.strip()
+                if q and q.lower() != topic.strip().lower() and q not in cleaned:
+                    cleaned.append(q)
+        return cleaned[:2]
+    except Exception:
+        return []
+
+
+def _dedup_items(items):
+    """Убирает дубликаты статей, найденных по разным языковым запросам.
+    Элемент считается уже виденным, если совпал хотя бы по одному идентификатору:
+    DOI, URL или нормализованное название. Это важно, потому что один и тот же
+    источник по русскому и английскому запросу может прийти с чуть разным набором
+    полей (у одной копии есть DOI, у другой — только URL, и т.п.)."""
+    seen_doi, seen_url, seen_title = set(), set(), set()
+    result = []
+    for it in items:
+        doi = (it.get("doi") or "").strip().lower()
+        url = (it.get("url") or "").strip().lower()
+        title_norm = "".join((it.get("title") or "").lower().split())
+        if (doi and doi in seen_doi) or (url and url in seen_url) \
+                or (title_norm and title_norm in seen_title):
+            continue
+        if not (doi or url or title_norm):
+            continue  # совсем пустая запись — пропускаем
+        if doi:
+            seen_doi.add(doi)
+        if url:
+            seen_url.add(url)
+        if title_norm:
+            seen_title.add(title_norm)
+        result.append(it)
+    return result
 
 
 # ------------------------- Загрузка списка доступных моделей -------------------------
@@ -795,6 +873,17 @@ with st.sidebar:
         "Проверять открытый доступ (Unpaywall) для найденных DOI", value=True,
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
     )
+    bilingual_search = st.checkbox(
+        "Искать также на английском (авто-перевод темы через ту же ИИ-модель)",
+        value=True,
+        help="Тема будет переведена на английский (1–2 варианта устоявшейся англ. "
+             "терминологии) и передана в каждый источник дополнительно к русскому "
+             "запросу. Результаты объединяются с удалением дубликатов по DOI/URL/"
+             "названию. Обзор всё равно пишется на русском — модель переводит "
+             "факты из англоязычных аннотаций при синтезе. Требует 1 доп. запроса "
+             "к ИИ-модели (короткий, дешёвый). Если модель не выдала перевод — "
+             "работает только русский поиск."
+    )
     semantic_scholar_key = st.text_input(
         "API-ключ Semantic Scholar (необязательно)", type="password",
         help="Без ключа запрос идёт в общий анонимный пул лимитов, который делят "
@@ -867,41 +956,81 @@ with tab1:
 
     if go:
         is_non_latin = any(ord(ch) > 127 for ch in topic)
-        if is_non_latin and "arXiv (препринты, тема на англ.)" in selected_sources:
+
+        # Формируем список поисковых запросов: русский оригинал + англ. варианты (если включено)
+        search_queries = [topic]
+        if bilingual_search and is_non_latin:
+            with st.spinner("Перевожу тему на английский для расширенного поиска…"):
+                try:
+                    en_queries = translate_topic_to_english(topic, provider, model_id, api_key)
+                except Exception as exc:
+                    en_queries = []
+                    st.warning(f"Не удалось перевести тему на английский ({exc}). "
+                                "Поиск пойдёт только по русскому запросу.")
+            if en_queries:
+                search_queries.extend(en_queries)
+                st.info("🌐 Двуязычный поиск. Запросы: " +
+                        " · ".join(f"«{q}»" for q in search_queries))
+            else:
+                st.info("Перевод не получен, поиск только по русскому запросу.")
+        elif bilingual_search and not is_non_latin:
+            # Тема уже на латинице — возможно, уже английская. Не дёргаем LLM ради перевода.
+            st.info("Тема уже на латинице, дополнительный перевод не требуется.")
+
+        if is_non_latin and "arXiv (препринты, тема на англ.)" in selected_sources \
+                and len(search_queries) == 1:
             st.info(
                 "Тема на нелатинице, а arXiv — англоязычная база препринтов: его "
                 "полнотекстовый поиск плохо понимает смысл нелатинских запросов и "
                 "может вернуть случайные совпадения по отдельным словам. "
-                "Для тем не на английском точнее работают Europe PMC, Crossref, "
-                "Semantic Scholar — у них многоязычные метаданные."
+                "Включите «Искать также на английском» — arXiv тогда получит "
+                "англоязычный вариант темы."
             )
+
         all_items = []
-        total_steps = len(selected_sources) + len(selected_patent_sources)
+        n_queries = len(search_queries)
+        total_steps = (len(selected_sources) + len(selected_patent_sources)) * n_queries
         progress = st.progress(0.0, text="Поиск источников…")
         SS_NAME = "Semantic Scholar (200M+ работ)"
-        for i, name in enumerate(selected_sources):
-            progress.progress(i / max(total_steps, 1), text=f"Ищу в {name}…")
-            if name in SOURCES:
-                if name == SS_NAME:
-                    found = SOURCES[name](topic, per_source, api_key=semantic_scholar_key)
-                else:
-                    found = SOURCES[name](topic, per_source)
-                all_items.extend(found)
+        step = 0
+        # Уменьшаем per_source при двуязычном поиске, чтобы итоговое количество
+        # источников на базу не раздувалось в N раз (после дедупа всё равно
+        # получится около нужного количества уникальных).
+        eff_per_source = max(2, per_source // n_queries) if n_queries > 1 else per_source
 
-        for j, name in enumerate(selected_patent_sources):
-            progress.progress(
-                (len(selected_sources) + j) / max(total_steps, 1), text=f"Ищу в {name}…"
-            )
-            fn, cred_fields = PATENT_SOURCES[name]
-            kwargs = {
-                kwarg_name: patent_credentials.get(storage_key, "")
-                for _label, storage_key, kwarg_name in cred_fields
-            }
-            found, error = fn(topic, per_source, **kwargs)
-            if error:
-                st.warning(error)
-            all_items.extend(found)
+        for q in search_queries:
+            for name in selected_sources:
+                progress.progress(step / max(total_steps, 1),
+                                  text=f"Ищу в {name} ({q[:40]}…)")
+                step += 1
+                if name in SOURCES:
+                    if name == SS_NAME:
+                        found = SOURCES[name](q, eff_per_source, api_key=semantic_scholar_key)
+                    else:
+                        found = SOURCES[name](q, eff_per_source)
+                    all_items.extend(found)
+
+            for name in selected_patent_sources:
+                progress.progress(step / max(total_steps, 1),
+                                  text=f"Ищу в {name} ({q[:40]}…)")
+                step += 1
+                fn, cred_fields = PATENT_SOURCES[name]
+                kwargs = {
+                    kwarg_name: patent_credentials.get(storage_key, "")
+                    for _label, storage_key, kwarg_name in cred_fields
+                }
+                found, error = fn(q, eff_per_source, **kwargs)
+                if error:
+                    st.warning(error)
+                all_items.extend(found)
         progress.progress(1.0, text="Поиск завершён")
+
+        # Дедупликация: одна и та же статья могла всплыть и по русскому, и по англ. запросу
+        before = len(all_items)
+        all_items = _dedup_items(all_items)
+        if before != len(all_items):
+            st.caption(f"Удалено дубликатов: {before - len(all_items)} "
+                       f"(одна статья найдена по нескольким языковым запросам).")
 
         # Фолбэк: если выбранные источники ничего не дали (например, все словили
         # 429/сбой одновременно) — автоматически пробуем остальные бесплатные базы,
@@ -913,12 +1042,14 @@ with tab1:
                     "Выбранные базы не вернули результатов (возможно, временный сбой "
                     "или лимит запросов). Пробую остальные бесплатные базы автоматически…"
                 )
-                for name in remaining:
-                    if name == SS_NAME:
-                        found = SOURCES[name](topic, per_source, api_key=semantic_scholar_key)
-                    else:
-                        found = SOURCES[name](topic, per_source)
-                    all_items.extend(found)
+                for q in search_queries:
+                    for name in remaining:
+                        if name == SS_NAME:
+                            found = SOURCES[name](q, eff_per_source, api_key=semantic_scholar_key)
+                        else:
+                            found = SOURCES[name](q, eff_per_source)
+                        all_items.extend(found)
+                all_items = _dedup_items(all_items)
 
         if check_oa:
             with st.spinner("Проверяю открытый доступ по DOI (Unpaywall)…"):
