@@ -3,11 +3,8 @@ app.py — Демо-система «Литературный обзор по т
 
 ЧТО ДЕЛАЕТ:
   1. Пользователь вводит тему в браузере (никакой установки — просто веб-страница).
-  2. Приложение ищет источники через бесплатные научные API (PubMed, arXiv,
-     Europe PMC, DOAJ, Semantic Scholar, Crossref + Unpaywall для платных статей),
-     а также опционально через открытые патентные базы (USPTO PatentsView, EPO OPS).
-     OpenAlex исключён из активных источников из-за постоянных ошибок доступа с IP
-     облачных хостингов (частые 403/429) — вместо него используется Semantic Scholar.
+  2. Приложение ищет источники через бесплатные научные API (OpenAlex, arXiv,
+     Europe PMC, DOAJ, Crossref + Unpaywall для платных статей).
   3. Собранные данные передаются в LLM (Claude или Gemini — на выбор), которая
      синтезирует обзор литературы с нумерованными ссылками [n].
   4. Результат показывается в браузере и скачивается как .docx.
@@ -252,18 +249,15 @@ def search_doaj(query, max_results=5):
         return []
 
 
-def search_semanticscholar(query, max_results=5, api_key=""):
-    """Semantic Scholar — 200M+ работ. Используется вместо OpenAlex: у OpenAlex стабильно
-    возникали ошибки доступа (403/429) при запросах с IP облачных хостингов.
-
-    ВАЖНО про 429: без ключа запрос идёт в ОБЩИЙ анонимный пул лимитов Semantic
-    Scholar, который делят между собой ВСЕ бесключевые обращения к API в мире —
-    включая другие приложения, размещённые на том же облачном хостинге (например,
-    Streamlit Community Cloud раздаёт IP из общего набора на тысячи чужих приложений).
-    429 может прилетать из-за чужого трафика, а не из-за количества ваших запросов.
-    Бесплатный личный ключ (https://www.semanticscholar.org/product/api#api-key)
-    даёт отдельный, куда более щедрый лимит — рекомендуется, если 429 повторяются."""
-    headers = {"x-api-key": api_key.strip()} if api_key.strip() else {}
+def search_semanticscholar(query, max_results=5):
+    """Semantic Scholar — 200M+ работ. Без ключа лимит ~1 req/s с shared IP (Streamlit Cloud
+    это бьёт). С бесплатным ключом лимит ~10 req/s. Ключ: semanticscholar.org/product/api.
+    Ключ читается из переменной SS_API_KEY или из session_state['ss_api_key']."""
+    ss_key = (os.environ.get("SS_API_KEY") or
+              st.session_state.get("ss_api_key", "")).strip()
+    headers = {}
+    if ss_key:
+        headers["x-api-key"] = ss_key
     try:
         r = _get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
@@ -289,8 +283,56 @@ def search_semanticscholar(query, max_results=5, api_key=""):
             })
         return items
     except Exception as exc:
-        st.warning(f"Semantic Scholar: не удалось получить данные ({exc})")
+        st.warning(f"Semantic Scholar: не удалось получить данные ({exc})"
+                   + ("" if ss_key else " — попробуйте добавить бесплатный ключ S2 в настройки источников"))
         return []
+
+
+def search_openaire(query, max_results=5):
+    """OpenAIRE — европейский агрегатор открытого доступа (85M+ публикаций),
+    без ключа, хорошо покрывает Европу, ВОЗ, ООН, европейские университеты.
+    Полноценная замена/дополнение к Semantic Scholar без ограничений по IP."""
+    try:
+        r = _get(
+            "https://api.openaire.eu/search/publications",
+            params={"keywords": query, "format": "json",
+                    "size": max_results, "sortBy": "relevancescore,descending"},
+            timeout=25,
+        )
+        r.raise_for_status()
+        data = r.json()
+        results = (data.get("response", {})
+                   .get("results", {})
+                   .get("result", []) or [])
+        items = []
+        for res in results[:max_results]:
+            meta = res.get("metadata", {}).get("oaf:entity", {}).get("oaf:result", {})
+            title_raw = meta.get("title", {})
+            title = (title_raw.get("$") if isinstance(title_raw, dict)
+                     else (title_raw[0].get("$") if isinstance(title_raw, list) and title_raw else "")) or "(без названия)"
+            date = meta.get("dateofacceptance", {})
+            year = (date.get("$", "н/д") if isinstance(date, dict) else str(date))[:4]
+            creators = meta.get("creator", [])
+            if isinstance(creators, dict):
+                creators = [creators]
+            authors = ", ".join(c.get("$", "") for c in creators[:5]) or "н/д"
+            pids = meta.get("pid", [])
+            if isinstance(pids, dict):
+                pids = [pids]
+            doi = next((p.get("$","") for p in pids
+                        if isinstance(p, dict) and p.get("@classid","").lower() == "doi"), "")
+            best_url = f"https://doi.org/{doi}" if doi else ""
+            descr = meta.get("description", {})
+            abstract = _trim(descr.get("$","") if isinstance(descr, dict) else "")
+            items.append({
+                "title": title, "authors": authors, "year": year,
+                "source": "OpenAIRE", "url": best_url, "doi": doi, "abstract": abstract,
+            })
+        return items
+    except Exception as exc:
+        st.warning(f"OpenAIRE: не удалось получить данные ({exc})")
+        return []
+
 
 
 def search_crossref(query, max_results=5):
@@ -351,56 +393,40 @@ def check_unpaywall(doi):
 # понятным описанием проблемы (модель показывает её пользователю, а не падает).
 
 
-# ============================== ПАТЕНТНЫЕ БАЗЫ ==============================
-# Проверено на июль 2026:
-#  - legacy api.patentsview.org ОТКЛЮЧЁН с 1 мая 2025 (301 на страницу миграции) —
-#    старая функция всегда падала с ошибкой, поэтому обзор "терял" патентные источники.
-#  - У WIPO PATENTSCOPE НЕТ публичного REST/JSON API вообще (подтверждено официальным
-#    каталогом API WIPO, apicatalog.wipo.int) — прежняя функция обращалась к
-#    несуществующему эндпоинту и не могла работать в принципе. Убрана.
-#  - Рабочие открытые варианты: новый PatentsView PatentSearch API (нужен бесплатный
-#    ключ, search.patentsview.org) и EPO OPS/Espacenet (нужна бесплатная регистрация).
+# ============================== ПАТЕНТНЫЕ БАЗЫ (БЕЗ КЛЮЧЕЙ) ==============================
 
-
-def search_patentsview(query, max_results=5, api_key=""):
-    """USPTO PatentsView PatentSearch API (новая версия, 2025+).
-    Старый api.patentsview.org отключён — актуальный эндпоинт search.patentsview.org
-    требует бесплатный ключ (X-Api-Key). Получить: https://patentsview.org/apis/purpose
-    (ссылка "Request an API Key"). Покрывает патенты США с 1976 года + аннотации.
-    Примечание: по состоянию на середину 2026 сервис сообщался как нестабильный
-    (эпизодические 500-е ошибки) — в этом случае используйте EPO OPS как основной
-    источник патентов."""
-    if not api_key.strip():
-        return [], ("USPTO PatentsView: нужен бесплатный API-ключ (старый доступ без "
-                     "ключа отключён с мая 2025). Получить: patentsview.org/apis/purpose")
+def search_patentsview_legacy(query, max_results=5):
+    """USPTO PatentsView — legacy endpoint, НЕ требует ключа (подтверждено 2026).
+    Покрывает все выданные патенты США с 1976 года + аннотации."""
     try:
-        r = _get(
-            "https://search.patentsview.org/api/v1/patent/",
-            params={
-                "q": json.dumps({"_text_any": {"patent_abstract": query}}),
-                "f": json.dumps(["patent_id", "patent_title", "patent_date",
-                                 "patent_abstract"]),
-                "o": json.dumps({"size": max_results}),
+        r = _post(
+            "https://api.patentsview.org/patents/query",
+            json={
+                "q": {"_text_any": {"patent_abstract": query}},
+                "f": ["patent_number", "patent_title", "patent_date",
+                      "assignee_organization", "patent_abstract", "inventor_last_name"],
+                "o": {"per_page": max_results},
+                "s": [{"patent_date": "desc"}],
             },
-            headers={"X-Api-Key": api_key.strip()},
             timeout=25,
         )
         r.raise_for_status()
         items = []
         for p in (r.json().get("patents") or [])[:max_results]:
-            pn = p.get("patent_id") or ""
+            pn = p.get("patent_number") or ""
             items.append({
                 "title": p.get("patent_title") or f"US Patent {pn}",
-                "authors": "н/д",
+                "authors": p.get("inventor_last_name") or "н/д",
                 "year": (p.get("patent_date") or "н/д")[:4],
                 "source": "USPTO PatentsView",
                 "url": f"https://worldwide.espacenet.com/patent/search?q=pn%3DUS{pn}",
                 "doi": "",
                 "abstract": _trim(p.get("patent_abstract") or ""),
             })
-        return items, None
+        return items
     except Exception as exc:
-        return [], f"USPTO PatentsView: ошибка запроса ({exc})"
+        st.warning(f"USPTO PatentsView: не удалось получить данные ({exc})")
+        return []
 
 
 def search_core_oa(query, max_results=5):
@@ -434,6 +460,43 @@ def search_core_oa(query, max_results=5):
     except Exception as exc:
         st.warning(f"CORE: не удалось получить данные ({exc})")
         return []
+
+
+def search_wipo_patentscope(query, max_results=5, token=""):
+    """WIPO PATENTSCOPE — международные патенты (PCT + 100+ ведомств).
+    Бесплатный доступ через REST API с токеном. Токен: patentscope.wipo.int → API Tools.
+    При пустом токене пробует публичный эндпоинт (ограниченные данные)."""
+    headers = {"Accept": "application/json"}
+    if token.strip():
+        headers["Authorization"] = f"Bearer {token.strip()}"
+    try:
+        r = _get(
+            "https://patentscope.wipo.int/api/v1/pct/patents",
+            params={"q": query, "maxCount": max_results, "offset": 0},
+            headers=headers,
+            timeout=25,
+        )
+        r.raise_for_status()
+        data = r.json()
+        items = []
+        for d in (data.get("results") or data.get("patents") or [])[:max_results]:
+            pnum = d.get("applicationNumber") or d.get("pctNumber") or ""
+            title_obj = d.get("IMPACT_EN") or d.get("invention_title") or {}
+            title = title_obj if isinstance(title_obj, str) else (
+                title_obj.get("text") if isinstance(title_obj, dict) else str(d.get("title",""))
+            ) or "(без названия)"
+            items.append({
+                "title": title,
+                "authors": ", ".join(d.get("inventors", []))[:3] if d.get("inventors") else "н/д",
+                "year": str(d.get("filingDate","н/д"))[:4],
+                "source": "WIPO PATENTSCOPE",
+                "url": f"https://patentscope.wipo.int/search/en/detail.jsf?docId={pnum}" if pnum else "",
+                "doi": "",
+                "abstract": _trim(str(d.get("abstract",""))),
+            })
+        return items, None
+    except Exception as exc:
+        return [], f"WIPO PATENTSCOPE: ошибка запроса ({exc}). Если запрос без токена — доступ может быть ограничен."
 
 
 def search_epo_ops_simple(query, max_results=5, consumer_key="", consumer_secret=""):
@@ -490,71 +553,127 @@ def search_epo_ops_simple(query, max_results=5, consumer_key="", consumer_secret
 
 
 PATENT_SOURCES = {
-    # Каждая функция здесь возвращает (items, error) — error=None при успехе.
-    # Поля учётных данных: (подпись, ключ хранения в session_state, имя kwarg функции).
-    "USPTO PatentsView (нужен бесплатный API-ключ)": (
-        search_patentsview, [("API-ключ PatentsView", "patentsview_api_key", "api_key")],
+    "USPTO PatentsView (патенты США, без ключа)": (
+        search_patentsview_legacy, []
+    ),
+    "WIPO PATENTSCOPE (PCT + 100 ведомств, токен опционален)": (
+        search_wipo_patentscope,
+        [("Access Token WIPO (оставьте пустым для публичного доступа)", "wipo_token")],
     ),
     "Espacenet / EPO OPS (бесплатная регистрация, Consumer Key+Secret)": (
         search_epo_ops_simple,
-        [("Consumer Key (EPO)", "epo_consumer_key", "consumer_key"),
-         ("Consumer Secret (EPO)", "epo_consumer_secret", "consumer_secret")],
+        [("Consumer Key (EPO)", "epo_key"), ("Consumer Secret (EPO)", "epo_secret")],
     ),
 }
+
+
+
+# PatentsView возвращает (items, None) / ([], msg) — адаптируем в обёртку
+def _patentsview_wrap(query, max_results=5):
+    """Обёртка, чтобы PatentsView вписывался в обычный SOURCES (возвращает list)."""
+    result = search_patentsview_legacy(query, max_results)
+    return result  # search_patentsview_legacy уже возвращает list и сам вызывает st.warning
 
 SOURCES = {
     "PubMed / NCBI (медицина, химия, биология)": search_pubmed,
     "Europe PMC (PMC + Европейская коллекция)": search_europepmc,
-    "Semantic Scholar (200M+ работ)": search_semanticscholar,
+    "OpenAIRE (85M+ открытых публикаций, без ключа)": search_openaire,
+    "Semantic Scholar (200M+ работ, опц. ключ)": search_semanticscholar,
     "Crossref (метаданные DOI + Unpaywall)": search_crossref,
     "DOAJ (открытые журналы)": search_doaj,
     "arXiv (препринты, тема на англ.)": search_arxiv,
 }
 
+# ============================== ИЗВЛЕЧЕНИЕ ПОИСКОВЫХ ЗАПРОСОВ ==============================
+# Источники, для которых нужен английский запрос (они плохо ищут по русским словам)
+ENGLISH_CENTRIC = {
+    "PubMed / NCBI (медицина, химия, биология)",
+    "Semantic Scholar (200M+ работ, опц. ключ)",
+    "OpenAIRE (85M+ открытых публикаций, без ключа)",
+    "arXiv (препринты, тема на англ.)",
+    "DOAJ (открытые журналы)",
+}
+
+
+def extract_search_queries(topic: str, api_key: str, provider: str, model_id: str) -> dict:
+    """Вызывает LLM чтобы извлечь ключевые научные термины из темы на русском и английском.
+    Возвращает {"ru": "...", "en": "..."}.
+    Это самый важный шаг: без него keyword-поиск по полной фразе темы
+    находит мусор (совпадение по случайным словам вроде «тренды», «анализ», «год»)."""
+    system = (
+        "Ты — помощник для научного поиска. "
+        "Извлеки из темы исследования 2-4 ключевых научных термина. "
+        "Верни ТОЛЬКО JSON без Markdown, без пояснений. "
+        'Схема: {"ru": "термины на русском", "en": "same in English"}. '
+        "Примеры: "
+        'тема «Сверхкритическая вода. Научные тренды 2023-2026» -> {"ru": "сверхкритическая вода", "en": "supercritical water"}; '
+        'тема «Масляные дисперсии как препаративная форма для СЗР» -> {"ru": "масляные дисперсии агрохимия", "en": "oil dispersion agrochemical formulation"}. '
+        "ТОЛЬКО JSON."
+    )
+    try:
+        raw = call_llm(provider, model_id, system, topic, api_key, temperature=0.0)
+        import json as _json, re as _re
+        # Убираем возможные markdown-бэктики
+        clean = _re.sub(r"```[a-z]*", "", raw).strip().strip("`")
+        parsed = _json.loads(clean)
+        ru = str(parsed.get("ru", topic)).strip() or topic
+        en = str(parsed.get("en", topic)).strip() or topic
+        return {"ru": ru, "en": en}
+    except Exception:
+        # Фолбэк: убираем самые частые «шумовые» слова из русского текста
+        import re as _re
+        stop_words = ["научные", "тренды", "обзор", "анализ", "исследование", "года", "год"]
+        stop_patterns = [r"20\d{2}[–\-]20\d{2}", r"20\d{2}"]
+        clean = topic
+        for sw in stop_words:
+            clean = _re.sub(sw, "", clean, flags=_re.IGNORECASE)
+        for pat in stop_patterns:
+            clean = _re.sub(pat, "", clean)
+        clean = " ".join(clean.split())  # убираем лишние пробелы
+        return {"ru": clean or topic, "en": clean or topic}
+
+
 # ============================== СИНТЕЗ ОБЗОРА (LLM) ==============================
 
 REVIEW_SYSTEM_PROMPT = """Ты — научный аналитик, готовящий раздел «Обзор литературы» для диссертации по естественнонаучной/технической теме.
 
-ПРАВИЛО СОДЕРЖАНИЯ — ГЛАВНОЕ:
-Обзор состоит из фактов предметной области. Из каждой аннотации извлекай:
-- точные названия веществ, соединений, материалов, реагентов, препаратов, штаммов, методов, приборов, алгоритмов — как написано в источнике;
-- химические формулы и обозначения (CH3COONa, HPMC K15M, EC50 = 0.3 мкМ) — переноси буквально;
-- количественные данные: концентрации, дозы, температуры, pH, вязкость, размеры частиц, эффективность, проценты, p-значение;
+ШАГ 1 — ФИЛЬТРАЦИЯ (молча, до написания текста):
+Оцени каждый источник: относится ли он к теме по СУЩЕСТВУ, а не по случайному слову.
+Если источник явно не по теме (например, экономический анализ при теме по физической химии) — исключи его полностью и молча. В итоговый текст и список литературы он не попадает. Никогда не пытайся «натянуть» нерелевантный источник на тему.
+
+ШАГ 2 — НАПИСАНИЕ ОБЗОРА (по отфильтрованным источникам):
+Пиши только то, что реально есть в аннотациях релевантных источников. Извлекай:
+- точные названия веществ, материалов, соединений, реагентов, методов, приборов;
+- химические формулы и обозначения — буквально как в источнике;
+- числа: температуры, давления, концентрации, pH, эффективность, проценты, p-значения;
 - механизмы и принципы действия — как описаны в источнике;
-- конкретные числовые результаты экспериментов.
+- конкретные результаты экспериментов с числами.
 
-СТРОГО ЗАПРЕЩЕНО в теле обзора:
-- «было найдено X источников», «источники были проанализированы», «проведён поиск» — это не научная информация;
-- обобщения без цифр («многие исследования показывают» без [n] и конкретных данных).
+ЗАПРЕЩЕНО в теле обзора:
+- «было найдено X источников», «источники были проанализированы», «проведён поиск»;
+- обобщения без цифр и ссылок; пересказ того, что ты делал.
 
-ОБЯЗАТЕЛЬНОЕ ПРАВИЛО — ТЫ ВСЕГДА ПИШЕШЬ ОБЗОР:
-- Используй ВСЕ предоставленные источники. Никогда не отказывайся от написания обзора целиком.
-- Если источник слабо связан с темой — используй из него то, что относится, и отметь в одном предложении его ограниченную релевантность.
-- Если аннотации не содержат технических деталей — напиши об этом в разделе «Выводы» как об ограничении, но раздел «Обзор литературы» всё равно заполни тем, что есть в источниках.
-- Не выдумывай факты, которых нет в аннотациях.
+ГАРАНТИЯ НЕПУСТОГО ВЫВОДА:
+- Если после фильтрации осталось ≥1 релевантного источника — напиши полноценный обзор по нему/ним.
+- Если релевантных источников не осталось совсем — напиши в разделе «Обзор литературы» одно честное предложение об этом, затем в разделе «Выводы» перечисли, что именно нужно искать и в каких базах.
+- Никогда не возвращай пустой текст.
 
-Каждое фактическое утверждение сопровождай ссылкой [n] на номер источника.
+Каждое фактическое утверждение — со ссылкой [n] на номер источника.
 
 Структура ответа (строго Markdown, на русском языке):
 ## Введение
-2-4 предложения: тема, актуальность, границы обзора. Без клише вроде «в данной работе рассматривается».
+2–4 предложения: тема, актуальность, границы обзора. Без канцелярских клише.
 
 ## Обзор литературы
-Тематический синтез с конкретными данными: вещества, формулы, параметры, механизмы, результаты. Ссылка [n] на каждый факт. Подзаголовки ### по подтемам, если нужно.
+Тематический синтез конкретных данных из источников. Ссылка [n] на каждый факт. Подзаголовки ### по подтемам при необходимости.
 
 ## Выводы и направления дальнейших исследований
 - Обоснованные выводы из данных [n]
-- Пробелы в изученности (какие параметры/механизмы не охвачены)
-- Рекомендации (явно как предположение)
+- Пробелы в изученности темы (каких данных не хватает)
+- Рекомендации (явно помечены как предположения)
 
 ## Список литературы
-[n] Авторы. Название. Год. Источник. URL.
-
-ЯЗЫК ОБЗОРА И ИСТОЧНИКОВ:
-- Тело обзора (Введение, Обзор литературы, Выводы) пишется ТОЛЬКО на русском языке, независимо от языка источников.
-- Аннотации источников могут быть на английском или другом языке — извлекай факты и передавай их по-русски своими словами. Не оставляй фрагменты на английском в тексте обзора.
-- Специальные термины, названия веществ/методов/приборов и химические формулы сохраняй как в источнике (например, «гидроксипропилметилцеллюлоза (HPMC K15M)», «CH3COONa», «EC50 = 0.3 мкМ»).
-- В «Списке литературы» название статьи оставляй на языке оригинала — не переводи. Авторы, год, источник, URL — как есть."""
+[n] Авторы. Название. Год. Источник. URL."""
 
 
 def build_user_message(topic, items):
@@ -575,63 +694,19 @@ def build_user_message(topic, items):
 
 
 def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash", temperature=0.3):
-    """Известная особенность моделей линейки Gemini 2.5/3.x: их "thinking"-токены
-    расходуются из ОБЩЕГО бюджета maxOutputTokens. Если не задать этот параметр
-    явно (лимит по умолчанию невелик) и не ограничить бюджет на размышления,
-    модель может потратить весь лимит на внутренний thinking и вернуть
-    finishReason=MAX_TOKENS с пустым text. Раньше это приводило к необработанному
-    KeyError при разборе ответа. Теперь:
-      1) явно задаём maxOutputTokens с запасом;
-      2) для thinking-моделей ограничиваем thinkingBudget, оставляя место под
-         сам текст обзора (для остальных моделей делаем retry без этого поля на 400);
-      3) вместо KeyError кидаем понятную ошибку с диагностикой (finishReason,
-         сколько токенов ушло на thinking), которую увидит пользователь."""
-    generation_config = {"temperature": temperature, "maxOutputTokens": 8192}
-    if any(tag in model for tag in ("2.5", "3.0", "3-", "thinking")):
-        generation_config["thinkingConfig"] = {"thinkingBudget": 1024}
-
-    def _do_request(cfg):
-        return httpx.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            params={"key": api_key},
-            json={
-                "system_instruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"role": "user", "parts": [{"text": user_message}]}],
-                "generationConfig": cfg,
-            },
-            timeout=120,
-        )
-
-    r = _do_request(generation_config)
-    if r.status_code == 400 and "thinkingConfig" in generation_config:
-        generation_config = dict(generation_config)
-        generation_config.pop("thinkingConfig")
-        r = _do_request(generation_config)
+    r = httpx.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        params={"key": api_key},
+        json={
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+            "generationConfig": {"temperature": temperature},
+        },
+        timeout=120,
+    )
     r.raise_for_status()
     data = r.json()
-
-    candidates = data.get("candidates") or []
-    if not candidates:
-        block_reason = (data.get("promptFeedback") or {}).get("blockReason")
-        raise RuntimeError(
-            "Gemini не вернул ни одного варианта ответа"
-            + (f" (blockReason={block_reason})" if block_reason else "")
-        )
-
-    cand = candidates[0]
-    parts = (cand.get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts).strip()
-    if not text:
-        finish_reason = cand.get("finishReason", "н/д")
-        thoughts = (data.get("usageMetadata") or {}).get("thoughtsTokenCount", 0)
-        raise RuntimeError(
-            f"Gemini вернул пустой текст (finishReason={finish_reason}, "
-            f"токенов на 'размышление': {thoughts}). Модель, вероятно, "
-            f"израсходовала весь лимит токенов на внутренний thinking. "
-            f"Попробуйте модель без thinking (например gemini-2.0-flash) "
-            f"или повторите запрос."
-        )
-    return text
+    return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def call_polza(system_prompt, user_message, api_key, model, temperature=0.3):
@@ -659,78 +734,6 @@ def call_llm(provider, model_id, system_prompt, user_message, api_key, temperatu
     if provider == "Google Gemini":
         return call_gemini(system_prompt, user_message, api_key, model=model_id, temperature=temperature)
     return call_polza(system_prompt, user_message, api_key, model=model_id, temperature=temperature)
-
-
-# ============================== ДВУЯЗЫЧНЫЙ ПОИСК ==============================
-
-TRANSLATE_SYSTEM_PROMPT = """Ты переводишь научные темы поиска с любого языка на английский.
-Задача: получить 1–2 англоязычных поисковых запроса, которые будут релевантны научным
-базам (PubMed, Crossref, Semantic Scholar). Правила:
-- Используй устоявшуюся англоязычную научную терминологию, а не дословный перевод.
-- НЕ добавляй кавычки, операторы AND/OR, комментарии, объяснения.
-- НЕ пиши преамбулы вроде "Here are the queries".
-- Верни строго JSON-массив строк. Пример: ["oil dispersions plant protection", "adjuvant oil emulsion pesticide formulation"]
-- Если тема уже на английском — верни массив с 1–2 уточнёнными формулировками той же темы."""
-
-
-def translate_topic_to_english(topic, provider, model_id, api_key):
-    """Переводит тему на английский с помощью той же LLM. Возвращает список из 1–2 англ. вариантов
-    (или пустой список, если что-то пошло не так — тогда двуязычный поиск просто не выполнится,
-    но обычный русский поиск остаётся). Использует temperature=0 для стабильности перевода."""
-    try:
-        raw = call_llm(provider, model_id, TRANSLATE_SYSTEM_PROMPT,
-                       f"Тема: {topic}", api_key, temperature=0.0)
-        raw = raw.strip()
-        # Модели иногда оборачивают JSON в ```json ... ``` — снимаем
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.lower().startswith("json"):
-                raw = raw[4:].lstrip()
-        # Ищем первый массив в тексте (на случай, если модель добавила преамбулу)
-        start = raw.find("[")
-        end = raw.rfind("]")
-        if start == -1 or end == -1 or end <= start:
-            return []
-        arr = json.loads(raw[start:end + 1])
-        if not isinstance(arr, list):
-            return []
-        # Оставляем только непустые строки, до 2 запросов, отличающиеся от исходной темы
-        cleaned = []
-        for q in arr:
-            if isinstance(q, str):
-                q = q.strip()
-                if q and q.lower() != topic.strip().lower() and q not in cleaned:
-                    cleaned.append(q)
-        return cleaned[:2]
-    except Exception:
-        return []
-
-
-def _dedup_items(items):
-    """Убирает дубликаты статей, найденных по разным языковым запросам.
-    Элемент считается уже виденным, если совпал хотя бы по одному идентификатору:
-    DOI, URL или нормализованное название. Это важно, потому что один и тот же
-    источник по русскому и английскому запросу может прийти с чуть разным набором
-    полей (у одной копии есть DOI, у другой — только URL, и т.п.)."""
-    seen_doi, seen_url, seen_title = set(), set(), set()
-    result = []
-    for it in items:
-        doi = (it.get("doi") or "").strip().lower()
-        url = (it.get("url") or "").strip().lower()
-        title_norm = "".join((it.get("title") or "").lower().split())
-        if (doi and doi in seen_doi) or (url and url in seen_url) \
-                or (title_norm and title_norm in seen_title):
-            continue
-        if not (doi or url or title_norm):
-            continue  # совсем пустая запись — пропускаем
-        if doi:
-            seen_doi.add(doi)
-        if url:
-            seen_url.add(url)
-        if title_norm:
-            seen_title.add(title_norm)
-        result.append(it)
-    return result
 
 
 # ------------------------- Загрузка списка доступных моделей -------------------------
@@ -854,7 +857,7 @@ with st.sidebar:
     contact_email_input = st.text_input(
         "Email для научных API (необязательно)",
         placeholder="you@example.com",
-        help="Некоторые API (Crossref, Europe PMC, PubMed) реже отказывают в "
+        help="Некоторые API (OpenAlex, Crossref, Europe PMC) реже отказывают в "
              "обслуживании, если передавать реальный email — это их 'вежливый пул'. "
              "Ключ/пароль здесь не нужен, только адрес."
     )
@@ -864,67 +867,29 @@ with st.sidebar:
     selected_sources = st.multiselect(
         "Выберите базы", list(SOURCES.keys()),
         default=["PubMed / NCBI (медицина, химия, биология)",
-                 "Semantic Scholar (200M+ работ)",
-                 "Crossref (метаданные DOI + Unpaywall)",
-                 "Europe PMC (PMC + Европейская коллекция)"],
+                 "OpenAIRE (85M+ открытых публикаций, без ключа)",
+                 "Crossref (метаданные DOI + Unpaywall)"],
     )
     per_source = st.slider("Источников на каждую базу", 2, 10, 4)
     check_oa = st.checkbox(
         "Проверять открытый доступ (Unpaywall) для найденных DOI", value=True,
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
     )
-    bilingual_search = st.checkbox(
-        "Искать также на английском (авто-перевод темы через ту же ИИ-модель)",
-        value=True,
-        help="Тема будет переведена на английский (1–2 варианта устоявшейся англ. "
-             "терминологии) и передана в каждый источник дополнительно к русскому "
-             "запросу. Результаты объединяются с удалением дубликатов по DOI/URL/"
-             "названию. Обзор всё равно пишется на русском — модель переводит "
-             "факты из англоязычных аннотаций при синтезе. Требует 1 доп. запроса "
-             "к ИИ-модели (короткий, дешёвый). Если модель не выдала перевод — "
-             "работает только русский поиск."
-    )
-    semantic_scholar_key = st.text_input(
-        "API-ключ Semantic Scholar (необязательно)", type="password",
-        help="Без ключа запрос идёт в общий анонимный пул лимитов, который делят "
-             "все бесключевые запросы к Semantic Scholar в мире — на нём часто "
-             "ловится 429 из-за чужого трафика, особенно с общих IP облачных "
-             "хостингов. Бесплатный личный ключ снимает эту проблему. Форма: "
-             "semanticscholar.org/product/api#api-key-form (ключ приходит на "
-             "почту, иногда через несколько дней).",
-    )
 
-    st.divider()
-    st.subheader("Патентные базы (опционально)")
-    st.caption(
-        "У обеих баз нет полностью бесплатного анонимного доступа (проверено — "
-        "полностью открытого API патентов сейчас не существует). "
-        "**EPO OPS/Espacenet (рекомендуется)**: developers.epo.org/user/register → "
-        "доступ 'Non-paying' → подтвердить email → 'My Apps' → 'Add a new App' → "
-        "получите Consumer Key/Secret (~5 минут, 3.5 ГБ/неделю бесплатно). "
-        "**PatentsView**: форма на ключ по ссылке ниже, но по свежим отчётам их "
-        "сервис поддержки и сам API нестабильны — используйте как резервный, не единственный."
-    )
-    PATENT_CRED_HELP = {
-        "epo_consumer_key": "developers.epo.org/user/register → 'Non-paying' → "
-                             "подтвердить email → 'My Apps' → 'Add a new App'.",
-        "epo_consumer_secret": "Выдаётся в той же карточке приложения, что и Consumer Key "
-                                "(вкладка 'Keys' в 'My Apps').",
-        "patentsview_api_key": "patentsview-support.atlassian.net/servicedesk/customer/"
-                                "portal/1/create/18 — форма 'Request a PatentSearch API Key'. "
-                                "Сервис нестабилен, используйте как резервный вариант.",
-    }
-    selected_patent_sources = st.multiselect(
-        "Выберите патентные базы", list(PATENT_SOURCES.keys()), default=[]
-    )
+    if "Semantic Scholar (200M+ работ, опц. ключ)" in selected_sources:
+        ss_key_input = st.text_input(
+            "API-ключ Semantic Scholar (необязательно)",
+            type="password",
+            help="Без ключа Semantic Scholar даёт ~1 запрос/сек — "
+                 "с общего IP Streamlit Cloud это вызывает 429. "
+                 "Бесплатный ключ: semanticscholar.org/product/api → Request API Key. "
+                 "Повышает лимит до ~10 req/s.",
+        )
+        if ss_key_input.strip():
+            st.session_state["ss_api_key"] = ss_key_input.strip()
+
+    # Все источники теперь в SOURCES, PATENT_SOURCES оставлен пустым
     patent_credentials = {}
-    for name in selected_patent_sources:
-        _fn, cred_fields = PATENT_SOURCES[name]
-        for label, storage_key, _kwarg_name in cred_fields:
-            patent_credentials[storage_key] = st.text_input(
-                f"{label} — {name}", type="password", key=f"patcred_{storage_key}",
-                help=PATENT_CRED_HELP.get(storage_key),
-            )
 
 
 tab1, tab2 = st.tabs(["📚 Обзор", "⚙️ Настройка промта"])
@@ -955,101 +920,28 @@ with tab1:
         st.info("Выберите модель в боковой панели, чтобы начать.")
 
     if go:
-        is_non_latin = any(ord(ch) > 127 for ch in topic)
+        # Шаг 0: извлекаем ключевые научные термины из темы до поиска
+        with st.spinner("🔍 Анализирую тему и формирую поисковые запросы…"):
+            queries = extract_search_queries(topic, api_key, provider, model_id)
 
-        # Формируем список поисковых запросов: русский оригинал + англ. варианты (если включено)
-        search_queries = [topic]
-        if bilingual_search and is_non_latin:
-            with st.spinner("Перевожу тему на английский для расширенного поиска…"):
-                try:
-                    en_queries = translate_topic_to_english(topic, provider, model_id, api_key)
-                except Exception as exc:
-                    en_queries = []
-                    st.warning(f"Не удалось перевести тему на английский ({exc}). "
-                                "Поиск пойдёт только по русскому запросу.")
-            if en_queries:
-                search_queries.extend(en_queries)
-                st.info("🌐 Двуязычный поиск. Запросы: " +
-                        " · ".join(f"«{q}»" for q in search_queries))
-            else:
-                st.info("Перевод не получен, поиск только по русскому запросу.")
-        elif bilingual_search and not is_non_latin:
-            # Тема уже на латинице — возможно, уже английская. Не дёргаем LLM ради перевода.
-            st.info("Тема уже на латинице, дополнительный перевод не требуется.")
-
-        if is_non_latin and "arXiv (препринты, тема на англ.)" in selected_sources \
-                and len(search_queries) == 1:
-            st.info(
-                "Тема на нелатинице, а arXiv — англоязычная база препринтов: его "
-                "полнотекстовый поиск плохо понимает смысл нелатинских запросов и "
-                "может вернуть случайные совпадения по отдельным словам. "
-                "Включите «Искать также на английском» — arXiv тогда получит "
-                "англоязычный вариант темы."
+        with st.expander("🔎 Поисковые запросы к базам данных", expanded=False):
+            st.markdown(
+                f"**Русский запрос:** `{queries['ru']}`  \n"
+                f"**Английский запрос:** `{queries['en']}`  \n"
+                "_Запросы автоматически извлечены из темы, чтобы избежать случайных "
+                "совпадений по вспомогательным словам (тренды, анализ, год и т.п.)_"
             )
 
         all_items = []
-        n_queries = len(search_queries)
-        total_steps = (len(selected_sources) + len(selected_patent_sources)) * n_queries
         progress = st.progress(0.0, text="Поиск источников…")
-        SS_NAME = "Semantic Scholar (200M+ работ)"
-        step = 0
-        # Уменьшаем per_source при двуязычном поиске, чтобы итоговое количество
-        # источников на базу не раздувалось в N раз (после дедупа всё равно
-        # получится около нужного количества уникальных).
-        eff_per_source = max(2, per_source // n_queries) if n_queries > 1 else per_source
-
-        for q in search_queries:
-            for name in selected_sources:
-                progress.progress(step / max(total_steps, 1),
-                                  text=f"Ищу в {name} ({q[:40]}…)")
-                step += 1
-                if name in SOURCES:
-                    if name == SS_NAME:
-                        found = SOURCES[name](q, eff_per_source, api_key=semantic_scholar_key)
-                    else:
-                        found = SOURCES[name](q, eff_per_source)
-                    all_items.extend(found)
-
-            for name in selected_patent_sources:
-                progress.progress(step / max(total_steps, 1),
-                                  text=f"Ищу в {name} ({q[:40]}…)")
-                step += 1
-                fn, cred_fields = PATENT_SOURCES[name]
-                kwargs = {
-                    kwarg_name: patent_credentials.get(storage_key, "")
-                    for _label, storage_key, kwarg_name in cred_fields
-                }
-                found, error = fn(q, eff_per_source, **kwargs)
-                if error:
-                    st.warning(error)
+        for i, name in enumerate(selected_sources):
+            progress.progress((i) / len(selected_sources), text=f"Ищу в {name}…")
+            # Англоязычным базам — английский запрос, остальным — русский
+            api_query = queries["en"] if name in ENGLISH_CENTRIC else queries["ru"]
+            if name in SOURCES:
+                found = SOURCES[name](api_query, per_source)
                 all_items.extend(found)
         progress.progress(1.0, text="Поиск завершён")
-
-        # Дедупликация: одна и та же статья могла всплыть и по русскому, и по англ. запросу
-        before = len(all_items)
-        all_items = _dedup_items(all_items)
-        if before != len(all_items):
-            st.caption(f"Удалено дубликатов: {before - len(all_items)} "
-                       f"(одна статья найдена по нескольким языковым запросам).")
-
-        # Фолбэк: если выбранные источники ничего не дали (например, все словили
-        # 429/сбой одновременно) — автоматически пробуем остальные бесплатные базы,
-        # прежде чем сдаваться. Так временный сбой одного API не обнуляет весь обзор.
-        if not all_items:
-            remaining = [n for n in SOURCES if n not in selected_sources]
-            if remaining:
-                st.info(
-                    "Выбранные базы не вернули результатов (возможно, временный сбой "
-                    "или лимит запросов). Пробую остальные бесплатные базы автоматически…"
-                )
-                for q in search_queries:
-                    for name in remaining:
-                        if name == SS_NAME:
-                            found = SOURCES[name](q, eff_per_source, api_key=semantic_scholar_key)
-                        else:
-                            found = SOURCES[name](q, eff_per_source)
-                        all_items.extend(found)
-                all_items = _dedup_items(all_items)
 
         if check_oa:
             with st.spinner("Проверяю открытый доступ по DOI (Unpaywall)…"):
@@ -1108,9 +1000,7 @@ with tab1:
 
     st.divider()
     st.caption(
-        "Демо-версия. Научные базы: PubMed, Europe PMC, Semantic Scholar, Crossref, "
-        "DOAJ, arXiv. Патентные базы (опционально, нужны бесплатные ключ/регистрация): "
-        "USPTO PatentsView, EPO OPS (Espacenet). "
+        "Демо-версия. Источники: Europe PMC, Semantic Scholar, Crossref, arXiv, DOAJ, USPTO PatentsView. "
         "Полный список используемых баз и логика проверки цитирования — в промт-шаблоне проекта."
     )
 
