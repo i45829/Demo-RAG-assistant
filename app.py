@@ -1,24 +1,6 @@
-"""
-app.py — Демо-система «Литературный обзор по теме» для презентации руководству.
-
-ЧТО ДЕЛАЕТ:
-  1. Пользователь вводит тему в браузере (никакой установки — просто веб-страница).
-  2. Приложение ищет источники через бесплатные научные API (OpenAlex, arXiv,
-     Europe PMC, DOAJ, Crossref + Unpaywall для платных статей).
-  3. Собранные данные передаются в LLM (Claude или Gemini — на выбор), которая
-     синтезирует обзор литературы с нумерованными ссылками [n].
-  4. Результат показывается в браузере и скачивается как .docx.
-
-ЗАПУСК ЛОКАЛЬНО (для проверки перед деплоем, не обязателен для демо):
-  pip install streamlit httpx python-docx
-  streamlit run app.py
-
-ДЕПЛОЙ (бесплатно, без установки на ПК начальства) — см. файл
-deploy_streamlit_cloud.md в комплекте.
-"""
-
 import io
 import os
+import time
 import base64
 import json
 from datetime import date
@@ -32,7 +14,46 @@ from docx.shared import Pt
 
 st.set_page_config(page_title="Литературный обзор — демо", page_icon="📚", layout="wide")
 
-CONTACT_EMAIL = "demo@example.com"  # свой email — нужен для "вежливого" доступа к API
+# Значение по умолчанию; перезаписывается реальным email из сайдбара при запуске —
+# так запросы к API попадают в "вежливый пул" (polite pool) и реже получают отказы.
+CONTACT_EMAIL = "demo@example.com"
+
+
+def _request_with_retry(method, url, retries=2, backoff=1.5, **kwargs):
+    """Обёртка над httpx с повторными попытками для временных сбоев (503, 502, 504,
+    таймауты). Многие публичные научные API периодически отдают 503 под нагрузкой —
+    без ключа/SLA это нормально, и одной короткой паузы обычно достаточно."""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            r = getattr(httpx, method)(url, **kwargs)
+            if r.status_code in (502, 503, 504) and attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            raise
+        except httpx.HTTPStatusError as exc:
+            last_exc = exc
+            if exc.response.status_code in (502, 503, 504) and attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            raise
+    raise last_exc
+
+
+def _get(url, **kwargs):
+    return _request_with_retry("get", url, **kwargs)
+
+
+def _post(url, **kwargs):
+    return _request_with_retry("post", url, **kwargs)
+
 
 # ============================== ПОИСК ПО ОТКРЫТЫМ API ==============================
 
@@ -56,7 +77,7 @@ def _reconstruct_abstract(inverted_index):
 
 def search_openalex(query, max_results=5):
     try:
-        r = httpx.get(
+        r = _get(
             "https://api.openalex.org/works",
             params={"search": query, "per-page": max_results, "mailto": CONTACT_EMAIL},
             timeout=20,
@@ -91,7 +112,7 @@ def search_openalex(query, max_results=5):
 def search_arxiv(query, max_results=5):
     try:
         import feedparser
-        r = httpx.get(
+        r = _get(
             "http://export.arxiv.org/api/query",
             params={"search_query": f"all:{query}", "start": 0,
                     "max_results": max_results, "sortBy": "relevance"},
@@ -118,7 +139,7 @@ def search_arxiv(query, max_results=5):
 
 def search_europepmc(query, max_results=5):
     try:
-        r = httpx.get(
+        r = _get(
             "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
             params={"query": query, "format": "json", "resultType": "core",
                     "pageSize": max_results, "email": CONTACT_EMAIL},
@@ -146,7 +167,7 @@ def search_europepmc(query, max_results=5):
 def search_doaj(query, max_results=5):
     try:
         from urllib.parse import quote
-        r = httpx.get(
+        r = _get(
             f"https://doaj.org/api/search/articles/{quote(query)}",
             params={"pageSize": max_results}, timeout=20,
         )
@@ -177,7 +198,7 @@ def search_doaj(query, max_results=5):
 def search_crossref(query, max_results=5):
     """Метаданные почти любого DOI, включая закрытые журналы (ScienceDirect и т.п.)."""
     try:
-        r = httpx.get(
+        r = _get(
             "https://api.crossref.org/works",
             params={"query": query, "rows": max_results, "mailto": CONTACT_EMAIL},
             timeout=20,
@@ -215,7 +236,7 @@ def check_unpaywall(doi):
     if not doi:
         return None
     try:
-        r = httpx.get(f"https://api.unpaywall.org/v2/{doi}",
+        r = _get(f"https://api.unpaywall.org/v2/{doi}",
                        params={"email": CONTACT_EMAIL}, timeout=15)
         r.raise_for_status()
         data = r.json()
@@ -234,7 +255,7 @@ def check_unpaywall(doi):
 
 def _epo_ops_token(client_key, client_secret):
     basic = base64.b64encode(f"{client_key}:{client_secret}".encode()).decode()
-    r = httpx.post(
+    r = _post(
         "https://ops.epo.org/3.2/auth/accesstoken",
         headers={"Authorization": f"Basic {basic}",
                  "Content-Type": "application/x-www-form-urlencoded"},
@@ -255,7 +276,7 @@ def search_epo_ops(query, max_results, client_key, client_secret):
         return [], f"Espacenet (EPO OPS): ошибка авторизации ({exc})"
     cql = query if "=" in query else f'ti="{query}" or ab="{query}"'
     try:
-        r = httpx.get(
+        r = _get(
             "https://ops.epo.org/3.2/rest-services/published-data/search/biblio",
             params={"q": cql, "Range": f"1-{max_results}"},
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -301,7 +322,7 @@ def search_patentsview(query, max_results, api_key):
         q = {"_text_any": {"patent_title": query}}
         f = ["patent_id", "patent_title", "patent_date"]
         o = {"size": max_results}
-        r = httpx.get(
+        r = _get(
             "https://search.patentsview.org/api/v1/patent/",
             params={"q": json.dumps(q), "f": json.dumps(f), "o": json.dumps(o)},
             headers={"X-Api-Key": api_key}, timeout=30,
@@ -333,7 +354,7 @@ def search_lens_patents(query, max_results, token):
     if not token:
         return [], "Lens.org: не указан токен — источник пропущен."
     try:
-        r = httpx.post(
+        r = _post(
             "https://api.lens.org/patent/search",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={"query": query, "size": max_results, "include": ["biblio", "lens_id"]},
@@ -589,6 +610,16 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Источники для поиска")
+    contact_email_input = st.text_input(
+        "Email для научных API (необязательно)",
+        placeholder="you@example.com",
+        help="Некоторые API (OpenAlex, Crossref, Europe PMC) реже отказывают в "
+             "обслуживании, если передавать реальный email — это их 'вежливый пул'. "
+             "Ключ/пароль здесь не нужен, только адрес."
+    )
+    if contact_email_input.strip():
+        CONTACT_EMAIL = contact_email_input.strip()
+
     all_source_names = list(SOURCES.keys()) + list(PATENT_SOURCES.keys())
     selected_sources = st.multiselect(
         "Выберите базы", all_source_names, default=list(SOURCES.keys())[:3]
@@ -634,7 +665,7 @@ with tab1:
         placeholder="Например: Барьеры перехода на электромобили в Европе (2023–2025): "
                     "инфраструктура, цена, меры господдержки",
         height=100,
-    )
+    ).strip()
 
     go = st.button(
         "🔎 Сформировать обзор", type="primary",
