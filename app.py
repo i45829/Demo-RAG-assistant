@@ -50,7 +50,13 @@ def _request_with_retry(method, url, retries=3, backoff=1.5, **kwargs):
     """Обёртка над httpx с повторными попытками для временных сбоев:
     429 (превышен лимит запросов — САМАЯ частая причина отказов у бесплатных API
     при вызовах с общего IP облачного хостинга, как у Streamlit Cloud), 502/503/504,
-    таймауты. Для 429 уважает заголовок Retry-After, если он есть."""
+    таймауты. Для 429 уважает заголовок Retry-After, если он есть.
+    follow_redirects=True по умолчанию — некоторые API (например arXiv) отдают 301
+    с http на https, а httpx по умолчанию редиректы НЕ проходит и падает с ошибкой."""
+    kwargs.setdefault("follow_redirects", True)
+    headers = kwargs.get("headers") or {}
+    headers.setdefault("User-Agent", f"lit-review-demo/1.0 (mailto:{CONTACT_EMAIL})")
+    kwargs["headers"] = headers
     last_exc = None
     for attempt in range(retries + 1):
         try:
@@ -143,7 +149,7 @@ def search_arxiv(query, max_results=5):
     try:
         import feedparser
         r = _get(
-            "http://export.arxiv.org/api/query",
+            "https://export.arxiv.org/api/query",
             params={"search_query": f"all:{query}", "start": 0,
                     "max_results": max_results, "sortBy": "relevance"},
             timeout=20,
@@ -222,6 +228,38 @@ def search_doaj(query, max_results=5):
         return items
     except Exception as exc:
         st.warning(f"DOAJ: не удалось получить данные ({exc})")
+        return []
+
+
+def search_semanticscholar(query, max_results=5):
+    """Semantic Scholar — 200M+ работ, без ключа (аноним. доступ ограничен по скорости,
+    но для демо этого достаточно). Резервный/дублирующий источник на случай перебоев
+    у OpenAlex — не полагаться на единственный источник надёжнее."""
+    try:
+        r = _get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={
+                "query": query, "limit": max_results,
+                "fields": "title,year,authors,abstract,externalIds,venue,url",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        items = []
+        for p in (r.json().get("data") or []):
+            doi = (p.get("externalIds") or {}).get("DOI", "")
+            items.append({
+                "title": p.get("title") or "(без названия)",
+                "authors": ", ".join(a.get("name", "") for a in (p.get("authors") or [])[:5]) or "н/д",
+                "year": p.get("year") or "н/д",
+                "source": "Semantic Scholar",
+                "url": f"https://doi.org/{doi}" if doi else (p.get("url") or ""),
+                "doi": doi,
+                "abstract": _trim(p.get("abstract") or ""),
+            })
+        return items
+    except Exception as exc:
+        st.warning(f"Semantic Scholar: не удалось получить данные ({exc})")
         return []
 
 
@@ -438,6 +476,7 @@ SOURCES = {
     "arXiv (препринты)": search_arxiv,
     "Europe PMC (PMC/PubMed)": search_europepmc,
     "DOAJ (открытые журналы)": search_doaj,
+    "Semantic Scholar (резервный источник)": search_semanticscholar,
     "Crossref (+ проверка Unpaywall)": search_crossref,
 }
 
@@ -471,6 +510,20 @@ REVIEW_SYSTEM_PROMPT = """Ты — научный аналитик, готовя
 факты, формулы, вещества, цифры или выводы, которых нет в материалах. Если аннотация
 источника не содержит технических деталей (только общие слова) — честно отметь это
 у данного источника, а не заполняй пробел общими фразами.
+
+ФИЛЬТРАЦИЯ ПО РЕЛЕВАНТНОСТИ (обязательный внутренний шаг перед синтезом):
+Источники присланы автоматическим поиском по ключевым словам и могут включать
+случайные, не относящиеся к теме совпадения (особенно при многоязычных запросах —
+поисковая система могла подобрать источник по формальному пересечению слов, а не по
+смыслу). Прежде чем писать обзор, мысленно оцени каждый источник: относится ли он
+РЕАЛЬНО к теме обзора по существу, а не только по случайному слову в названии.
+- Источники, явно не относящиеся к теме, ПОЛНОСТЬЮ исключи: не цитируй их в тексте,
+  не включай в «Список литературы», не упоминай, что они были исключены.
+- Не сообщай в выводе, сколько источников отфильтровано — сделай это молча, обзор
+  должен выглядеть так, будто нерелевантных источников не было вовсе.
+- Если после фильтрации релевантных источников осталось мало или не осталось совсем —
+  честно скажи об этом в начале раздела «Обзор литературы» одним предложением, вместо
+  того чтобы притягивать нерелевантные источники к теме искусственно.
 
 Каждое фактическое утверждение сопровождай числовой ссылкой [n], соответствующей
 номеру источника в списке. Пиши как тематический синтез: где источники согласуются
@@ -679,7 +732,9 @@ with st.sidebar:
 
     all_source_names = list(SOURCES.keys()) + list(PATENT_SOURCES.keys())
     selected_sources = st.multiselect(
-        "Выберите базы", all_source_names, default=list(SOURCES.keys())[:3]
+        "Выберите базы", all_source_names,
+        default=["OpenAlex (научные работы)", "Semantic Scholar (резервный источник)",
+                 "Crossref (+ проверка Unpaywall)"],
     )
     per_source = st.slider("Источников на каждую базу", 2, 10, 4)
     check_oa = st.checkbox(
@@ -735,6 +790,15 @@ with tab1:
         st.info("Выберите модель в боковой панели, чтобы начать.")
 
     if go:
+        is_non_latin = any(ord(ch) > 127 for ch in topic)
+        if is_non_latin and "arXiv (препринты)" in selected_sources:
+            st.info(
+                "Тема на нелатинице, а arXiv — англоязычная база препринтов: его "
+                "полнотекстовый поиск плохо понимает смысл нелатинских запросов и "
+                "может вернуть случайные совпадения по отдельным словам. "
+                "Для тем не на английском точнее работают OpenAlex, Crossref, "
+                "Semantic Scholar и Europe PMC — у них многоязычные метаданные."
+            )
         all_items = []
         progress = st.progress(0.0, text="Поиск источников…")
         for i, name in enumerate(selected_sources):
