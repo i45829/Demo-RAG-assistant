@@ -688,14 +688,17 @@ def _cosine_similarity(v1: list, v2: list) -> float:
 
 def filter_by_relevance(topic_translated: dict, items: list, provider: str,
                         api_key: str, embedding_model: str,
-                        threshold: float = 0.55) -> tuple:
-    """Оставляет только статьи, косинусно близкие к теме (по эмбеддингам).
-    Возвращает (отфильтрованный список, оценки для отчёта).
+                        threshold=None) -> tuple:
+    """Сортирует статьи по косинусной близости к теме (по эмбеддингам).
+    Возвращает (filtered_items, scored_items).
 
-    threshold=0.55 подобран как разумный компромисс:
-    - <0.45: мусор проходит
-    - 0.55: отсекает явно нерелевантное, сохраняя пограничные случаи
-    - >0.65: слишком строго, теряются близкие по духу работы"""
+    В основном сценарии threshold=None: это именно ранжирование, а не жёсткий отсев.
+    Поэтому настройка «источников на каждую базу» работает ожидаемо: берём top-N
+    из найденных кандидатов, если база вернула достаточно результатов.
+
+    Если threshold задан числом, функция дополнительно отбрасывает статьи ниже порога.
+    Это можно использовать для более строгого режима, но в демо по умолчанию он
+    отключён, чтобы пользователь не получал 12 источников при выбранных 10 на базу."""
     if not items:
         return items, []
 
@@ -738,10 +741,14 @@ def filter_by_relevance(topic_translated: dict, items: list, provider: str,
     # Сортируем по убыванию релевантности
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # Оставляем прошедшие порог, но не меньше 3 (даже если все близки к границе)
-    filtered = [it for it, score in scored if score >= threshold]
-    if len(filtered) < 3 and len(scored) >= 3:
-        filtered = [it for it, _ in scored[:3]]
+    if threshold is None:
+        filtered = [it for it, _ in scored]
+    else:
+        # Строгий режим: оставляем прошедшие порог, но не меньше 3,
+        # чтобы при узких темах обзор не становился пустым.
+        filtered = [it for it, score in scored if score >= threshold]
+        if len(filtered) < 3 and len(scored) >= 3:
+            filtered = [it for it, _ in scored[:3]]
 
     return filtered, scored
 
@@ -1131,19 +1138,59 @@ with st.sidebar:
         CONTACT_EMAIL = contact_email_input.strip()
 
     all_source_names = list(SOURCES.keys()) + list(PATENT_SOURCES.keys())
+    default_source_names = list(SOURCES.keys()) + list(PATENT_SOURCES.keys())
+    default_sources_version = "sources-defaults-v2-rospatent"
+
+    # Streamlit хранит значение multiselect в session_state. Если пользователь уже
+    # запускал старую версию приложения, новый default сам по себе не применится.
+    # Поэтому один раз мигрируем старое состояние: добавляем Роспатент к текущему
+    # выбору, но не навязываем его на каждом rerun — после миграции его можно снять вручную.
+    if st.session_state.get("selected_sources_defaults_version") != default_sources_version:
+        current_sources = st.session_state.get("selected_sources_widget")
+        if current_sources:
+            migrated_sources = list(dict.fromkeys(list(current_sources) + list(PATENT_SOURCES.keys())))
+        else:
+            migrated_sources = default_source_names
+        st.session_state["selected_sources_widget"] = [
+            name for name in migrated_sources if name in all_source_names
+        ]
+        st.session_state["selected_sources_defaults_version"] = default_sources_version
+
     selected_sources = st.multiselect(
-        "Выберите базы", all_source_names,
-        default=list(SOURCES.keys()),
+        "Выберите базы",
+        all_source_names,
+        key="selected_sources_widget",
     )
     per_source = st.slider(
-        "Релевантных источников на каждую базу", 2, 10, 4,
-        help="Целевое число статей от каждой базы ПОСЛЕ фильтрации по релевантности. "
-             "Приложение тянет из API в 3× больше и оставляет топ-N по эмбеддингам."
+        "Источников на каждую базу", 2, 10, 4,
+        help="Сколько лучших результатов брать из каждой выбранной базы. "
+             "Приложение тянет из API в 3× больше, ранжирует кандидатов по эмбеддингам "
+             "и оставляет top-N. Это не жёсткий пороговый отсев."
     )
     check_oa = st.checkbox(
         "Проверять открытый доступ (Unpaywall) для найденных DOI", value=True,
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
     )
+
+    st.divider()
+    if st.button(
+        "🧹 Очистить кеш и сбросить состояние",
+        help="Сбрасывает @st.cache_data/@st.cache_resource и очищает состояние формы. "
+             "После перезапуска можно повторить запрос с базами по умолчанию, включая Роспатент."
+    ):
+        st.cache_data.clear()
+        try:
+            st.cache_resource.clear()
+        except Exception:
+            pass
+        # Очищаем состояние виджетов, которое мешает применению новых default-значений.
+        for key in list(st.session_state.keys()):
+            if key.startswith("selected_sources") or key.startswith("cache_cleared"):
+                del st.session_state[key]
+        st.session_state["cache_cleared_notice"] = True
+        st.rerun()
+    if st.session_state.pop("cache_cleared_notice", False):
+        st.success("Кеш и состояние формы очищены. Можно повторить запрос.")
 
     # Поля для ключей выбранных патентных источников
     selected_patent_sources = [s for s in selected_sources if s in PATENT_SOURCES]
@@ -1233,21 +1280,24 @@ with tab1:
             else:
                 found = []
 
-            # Фильтруем эту базу отдельно: сначала отсев по порогу, затем top-N.
-            # Если embeddings недоступны или результатов мало — берём первые N по порядку API.
+            # Ранжируем эту базу отдельно и берём top-N.
+            # Важно: здесь нет жёсткого порога отсечения. Ползунок означает
+            # «взять до N лучших источников из каждой базы», а не «взять N только если
+            # они выше произвольного score». Поэтому пользователь не получает резкое
+            # падение общего числа источников из-за одного порога embeddings.
             if found and embedding_model_id and len(found) > per_source:
                 try:
-                    filtered_here, scored_here = filter_by_relevance(
+                    ranked_here, scored_here = filter_by_relevance(
                         queries, found, provider, api_key, embedding_model_id,
-                        threshold=0.55,
+                        threshold=None,
                     )
-                    top_items = filtered_here[:per_source]
+                    top_items = ranked_here[:per_source]
                     kept_ids = {id(it) for it in top_items}
                     all_items.extend(top_items)
                     for it, score in scored_here:
                         all_scored_report.append((it, score, name, id(it) in kept_ids))
                 except Exception as exc:
-                    st.warning(f"{name}: фильтр эмбеддингов не сработал ({exc}), "
+                    st.warning(f"{name}: ранжирование по эмбеддингам не сработало ({exc}), "
                                f"беру первые {per_source} по порядку API")
                     all_items.extend(found[:per_source])
             else:
@@ -1265,8 +1315,8 @@ with tab1:
             kept_count = sum(1 for *_, kept in all_scored_report if kept)
             dropped_count = len(all_scored_report) - kept_count
             with st.expander(
-                f"🎯 Фильтр релевантности: оставлено {kept_count}, "
-                f"отброшено {dropped_count} (по эмбеддингам)", expanded=False
+                f"🎯 Ранжирование релевантности: выбрано {kept_count}, "
+                f"не выбрано {dropped_count} (по эмбеддингам)", expanded=False
             ):
                 # Группируем по базе
                 by_source = {}
