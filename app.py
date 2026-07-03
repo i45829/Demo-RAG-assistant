@@ -289,41 +289,39 @@ def search_semanticscholar(query, max_results=5):
 
 
 def search_openaire(query, max_results=5):
-    """OpenAIRE — европейский агрегатор открытого доступа (85M+ публикаций),
-    без ключа, хорошо покрывает Европу, ВОЗ, ООН, европейские университеты.
-    Полноценная замена/дополнение к Semantic Scholar без ограничений по IP."""
+    """OpenAIRE Graph API — актуальный стабильный endpoint researchProducts.
+    Старый /search/publications часто отдаёт 400 из-за смены схемы параметров."""
     try:
         r = _get(
-            "https://api.openaire.eu/search/publications",
-            params={"keywords": query, "format": "json",
-                    "size": max_results, "sortBy": "relevancescore,descending"},
+            "https://api.openaire.eu/graph/v1/researchProducts",
+            params={"search": query, "type": "publication", "pageSize": max_results},
             timeout=25,
         )
         r.raise_for_status()
         data = r.json()
-        results = (data.get("response", {})
-                   .get("results", {})
-                   .get("result", []) or [])
+        results = data.get("results", []) or []
         items = []
         for res in results[:max_results]:
-            meta = res.get("metadata", {}).get("oaf:entity", {}).get("oaf:result", {})
-            title_raw = meta.get("title", {})
-            title = (title_raw.get("$") if isinstance(title_raw, dict)
-                     else (title_raw[0].get("$") if isinstance(title_raw, list) and title_raw else "")) or "(без названия)"
-            date = meta.get("dateofacceptance", {})
-            year = (date.get("$", "н/д") if isinstance(date, dict) else str(date))[:4]
-            creators = meta.get("creator", [])
-            if isinstance(creators, dict):
-                creators = [creators]
-            authors = ", ".join(c.get("$", "") for c in creators[:5]) or "н/д"
-            pids = meta.get("pid", [])
-            if isinstance(pids, dict):
-                pids = [pids]
-            doi = next((p.get("$","") for p in pids
-                        if isinstance(p, dict) and p.get("@classid","").lower() == "doi"), "")
-            best_url = f"https://doi.org/{doi}" if doi else ""
-            descr = meta.get("description", {})
-            abstract = _trim(descr.get("$","") if isinstance(descr, dict) else "")
+            # v1 Graph API: плоская структура с mainTitle, publicationDate, authors, pids, description
+            title = res.get("mainTitle") or "(без названия)"
+            year = str(res.get("publicationDate") or "н/д")[:4]
+            authors_raw = res.get("authors", []) or []
+            authors = ", ".join(
+                a.get("fullName", "") for a in authors_raw[:5] if isinstance(a, dict)
+            ) or "н/д"
+            pids = res.get("pids", []) or []
+            doi = ""
+            for pid in pids:
+                if isinstance(pid, dict) and (pid.get("scheme") or "").lower() == "doi":
+                    doi = pid.get("value", "")
+                    break
+            best_url = f"https://doi.org/{doi}" if doi else (res.get("id", "") or "")
+            descriptions = res.get("descriptions", []) or []
+            desc_text = ""
+            if descriptions:
+                first = descriptions[0]
+                desc_text = first.get("value", "") if isinstance(first, dict) else str(first)
+            abstract = _trim(desc_text)
             items.append({
                 "title": title, "authors": authors, "year": year,
                 "source": "OpenAIRE", "url": best_url, "doi": doi, "abstract": abstract,
@@ -332,7 +330,6 @@ def search_openaire(query, max_results=5):
     except Exception as exc:
         st.warning(f"OpenAIRE: не удалось получить данные ({exc})")
         return []
-
 
 
 def search_crossref(query, max_results=5):
@@ -395,38 +392,6 @@ def check_unpaywall(doi):
 
 # ============================== ПАТЕНТНЫЕ БАЗЫ (БЕЗ КЛЮЧЕЙ) ==============================
 
-def search_patentsview_legacy(query, max_results=5):
-    """USPTO PatentsView — legacy endpoint, НЕ требует ключа (подтверждено 2026).
-    Покрывает все выданные патенты США с 1976 года + аннотации."""
-    try:
-        r = _post(
-            "https://api.patentsview.org/patents/query",
-            json={
-                "q": {"_text_any": {"patent_abstract": query}},
-                "f": ["patent_number", "patent_title", "patent_date",
-                      "assignee_organization", "patent_abstract", "inventor_last_name"],
-                "o": {"per_page": max_results},
-                "s": [{"patent_date": "desc"}],
-            },
-            timeout=25,
-        )
-        r.raise_for_status()
-        items = []
-        for p in (r.json().get("patents") or [])[:max_results]:
-            pn = p.get("patent_number") or ""
-            items.append({
-                "title": p.get("patent_title") or f"US Patent {pn}",
-                "authors": p.get("inventor_last_name") or "н/д",
-                "year": (p.get("patent_date") or "н/д")[:4],
-                "source": "USPTO PatentsView",
-                "url": f"https://worldwide.espacenet.com/patent/search?q=pn%3DUS{pn}",
-                "doi": "",
-                "abstract": _trim(p.get("patent_abstract") or ""),
-            })
-        return items
-    except Exception as exc:
-        st.warning(f"USPTO PatentsView: не удалось получить данные ({exc})")
-        return []
 
 
 def search_core_oa(query, max_results=5):
@@ -462,107 +427,65 @@ def search_core_oa(query, max_results=5):
         return []
 
 
-def search_wipo_patentscope(query, max_results=5, token=""):
-    """WIPO PATENTSCOPE — международные патенты (PCT + 100+ ведомств).
-    Бесплатный доступ через REST API с токеном. Токен: patentscope.wipo.int → API Tools.
-    При пустом токене пробует публичный эндпоинт (ограниченные данные)."""
-    headers = {"Accept": "application/json"}
-    if token.strip():
-        headers["Authorization"] = f"Bearer {token.strip()}"
-    try:
-        r = _get(
-            "https://patentscope.wipo.int/api/v1/pct/patents",
-            params={"q": query, "maxCount": max_results, "offset": 0},
-            headers=headers,
-            timeout=25,
-        )
-        r.raise_for_status()
-        data = r.json()
-        items = []
-        for d in (data.get("results") or data.get("patents") or [])[:max_results]:
-            pnum = d.get("applicationNumber") or d.get("pctNumber") or ""
-            title_obj = d.get("IMPACT_EN") or d.get("invention_title") or {}
-            title = title_obj if isinstance(title_obj, str) else (
-                title_obj.get("text") if isinstance(title_obj, dict) else str(d.get("title",""))
-            ) or "(без названия)"
-            items.append({
-                "title": title,
-                "authors": ", ".join(d.get("inventors", []))[:3] if d.get("inventors") else "н/д",
-                "year": str(d.get("filingDate","н/д"))[:4],
-                "source": "WIPO PATENTSCOPE",
-                "url": f"https://patentscope.wipo.int/search/en/detail.jsf?docId={pnum}" if pnum else "",
-                "doi": "",
-                "abstract": _trim(str(d.get("abstract",""))),
-            })
-        return items, None
-    except Exception as exc:
-        return [], f"WIPO PATENTSCOPE: ошибка запроса ({exc}). Если запрос без токена — доступ может быть ограничен."
 
 
-def search_epo_ops_simple(query, max_results=5, consumer_key="", consumer_secret=""):
-    """EPO OPS (Espacenet) — патенты всех крупных ведомств через европейское патентное ведомство.
-    Бесплатная регистрация на developers.epo.org → My Apps → Consumer Key/Secret."""
-    if not consumer_key or not consumer_secret:
-        return [], "EPO OPS (Espacenet): укажите Consumer Key и Secret (бесплатная регистрация на developers.epo.org)."
+
+def search_rospatent(query, max_results=5, api_key=""):
+    """Роспатент — Поисковая платформа (searchplatform.rospatent.gov.ru).
+    Требует JWT-токен (API-ключ), выдаётся в личном кабинете Роспатента.
+    Поисковая база: патенты РФ, СНГ, PCT-минимум (CN, US, EP, JP, KR, DE, FR и др.)."""
+    if not api_key or not api_key.strip():
+        return [], "Роспатент: не указан API-ключ (JWT) — источник пропущен."
     try:
-        tok_r = _post(
-            "https://ops.epo.org/3.2/auth/accesstoken",
-            headers={"Authorization": "Basic " + base64.b64encode(
-                f"{consumer_key}:{consumer_secret}".encode()).decode(),
-                "Content-Type": "application/x-www-form-urlencoded"},
-            data={"grant_type": "client_credentials"}, timeout=20,
-        )
-        tok_r.raise_for_status()
-        token = tok_r.json()["access_token"]
-    except Exception as exc:
-        return [], f"EPO OPS: ошибка авторизации ({exc})"
-    cql = query if "=" in query else f'ti="{query}" or ab="{query}"'
-    try:
-        r = _get(
-            "https://ops.epo.org/3.2/rest-services/published-data/search/biblio",
-            params={"q": cql, "Range": f"1-{max_results}"},
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            timeout=25,
+        r = _post(
+            "https://searchplatform.rospatent.gov.ru/patsearch/v0.2/search",
+            headers={
+                "Authorization": f"Bearer {api_key.strip()}",
+                "Content-Type": "application/json",
+            },
+            json={"qn": query, "limit": max_results},
+            timeout=30,
         )
         r.raise_for_status()
         data = r.json()
     except Exception as exc:
-        return [], f"EPO OPS: ошибка поиска ({exc})"
+        return [], f"Роспатент: ошибка запроса ({exc})"
+
     items = []
-    try:
-        biblio = (data.get("ops:world-patent-data") or {}).get("ops:biblio-search") or {}
-        docs = (biblio.get("ops:search-result") or {}).get("ops:publication-reference", [])
-        if isinstance(docs, dict):
-            docs = [docs]
-        for d in docs[:max_results]:
-            did = d.get("document-id", {})
-            country = (did.get("country") or {}).get("$", "")
-            num = (did.get("doc-number") or {}).get("$", "")
-            kind = (did.get("kind") or {}).get("$", "")
-            pn = f"{country}{num}{kind}"
-            items.append({
-                "title": f"Патент {pn}",
-                "authors": "н/д", "year": "н/д",
-                "source": "Espacenet (EPO OPS)",
-                "url": f"https://worldwide.espacenet.com/patent/search?q=pn%3D{country}{num}",
-                "doi": "", "abstract": "",
-            })
-    except Exception as exc:
-        return [], f"EPO OPS: не удалось разобрать ответ ({exc})"
+    for hit in (data.get("hits") or [])[:max_results]:
+        biblio_ru = (hit.get("biblio") or {}).get("ru", {}) or {}
+        biblio_en = (hit.get("biblio") or {}).get("en", {}) or {}
+        title = biblio_ru.get("title") or biblio_en.get("title") or "(без названия)"
+        inventors = biblio_ru.get("inventor") or biblio_en.get("inventor") or []
+        authors = ", ".join(inv.get("name", "") for inv in inventors[:5]) or "н/д"
+        common = hit.get("common") or {}
+        pub_date = common.get("publication_date", "н/д")
+        year = pub_date[:4] if pub_date and pub_date != "н/д" else "н/д"
+        country = common.get("publishing_office", "")
+        doc_num = common.get("document_number", "")
+        kind = common.get("kind", "")
+        pn = f"{country}{doc_num}{kind}" if country and doc_num else hit.get("id", "")
+        snippet = hit.get("snippet") or {}
+        descr = snippet.get("description", "")
+        # Очищаем HTML-тэги подсветки
+        import re as _re
+        descr_clean = _re.sub(r"<[^>]+>", "", descr) if descr else ""
+        items.append({
+            "title": title,
+            "authors": authors,
+            "year": year,
+            "source": "Роспатент",
+            "url": f"https://searchplatform.rospatent.gov.ru/docs/{hit.get('id', '')}" if hit.get("id") else "",
+            "doi": "",
+            "abstract": _trim(descr_clean),
+        })
     return items, None
 
 
 PATENT_SOURCES = {
-    "USPTO PatentsView (патенты США, без ключа)": (
-        search_patentsview_legacy, []
-    ),
-    "WIPO PATENTSCOPE (PCT + 100 ведомств, токен опционален)": (
-        search_wipo_patentscope,
-        [("Access Token WIPO (оставьте пустым для публичного доступа)", "wipo_token")],
-    ),
-    "Espacenet / EPO OPS (бесплатная регистрация, Consumer Key+Secret)": (
-        search_epo_ops_simple,
-        [("Consumer Key (EPO)", "epo_key"), ("Consumer Secret (EPO)", "epo_secret")],
+    "Роспатент (патенты РФ, СНГ, PCT — нужен JWT-ключ)": (
+        search_rospatent,
+        [("API-ключ Роспатента (JWT-токен)", "rospatent_key")],
     ),
 }
 
@@ -578,7 +501,6 @@ SOURCES = {
     "PubMed / NCBI (медицина, химия, биология)": search_pubmed,
     "Europe PMC (PMC + Европейская коллекция)": search_europepmc,
     "OpenAIRE (85M+ открытых публикаций, без ключа)": search_openaire,
-    "Semantic Scholar (200M+ работ, опц. ключ)": search_semanticscholar,
     "Crossref (метаданные DOI + Unpaywall)": search_crossref,
     "DOAJ (открытые журналы)": search_doaj,
     "arXiv (препринты, тема на англ.)": search_arxiv,
@@ -588,7 +510,6 @@ SOURCES = {
 # Источники, для которых нужен английский запрос (они плохо ищут по русским словам)
 ENGLISH_CENTRIC = {
     "PubMed / NCBI (медицина, химия, биология)",
-    "Semantic Scholar (200M+ работ, опц. ключ)",
     "OpenAIRE (85M+ открытых публикаций, без ключа)",
     "arXiv (препринты, тема на англ.)",
     "DOAJ (открытые журналы)",
@@ -676,8 +597,20 @@ REVIEW_SYSTEM_PROMPT = """Ты — научный аналитик, готовя
 [n] Авторы. Название. Год. Источник. URL."""
 
 
+# Максимум символов на один источник зависит от числа источников:
+# мало источников → длинные аннотации; много → обрезаем, чтобы не перегрузить контекст.
+_MAX_TOTAL_CONTEXT = 60_000   # ~15K токенов — комфортно для всех моделей
+_MIN_ABSTRACT_PER_ITEM = 300  # минимум даже при большом количестве источников
+
+
 def build_user_message(topic, items):
     n_with_abstract = sum(1 for it in items if it.get("abstract", "").strip())
+    # Динамический лимит аннотации на источник
+    if items:
+        budget = max(_MIN_ABSTRACT_PER_ITEM,
+                     (_MAX_TOTAL_CONTEXT - len(topic) - 500) // len(items))
+    else:
+        budget = 1500
     lines = [
         f"ТЕМА ОБЗОРА: {topic}", "",
         f"ИСТОЧНИКОВ ПЕРЕДАНО: {len(items)}, из них с аннотацией: {n_with_abstract}.",
@@ -685,49 +618,105 @@ def build_user_message(topic, items):
         "пометив '(аннотация недоступна)'. НЕ оставляй обзор пустым.", "",
     ]
     for i, it in enumerate(items, 1):
+        abst = (it.get("abstract") or "н/д").strip()
+        if len(abst) > budget:
+            abst = abst[:budget] + "…"
         lines.append(
             f"[{i}] {it['title']} ({it['year']}). Авторы: {it['authors']}. "
             f"Источник: {it['source']}. URL: {it['url'] or 'н/д'}\n"
-            f"Аннотация: {it['abstract'] or 'н/д'}\n"
+            f"Аннотация: {abst}\n"
         )
     return "\n".join(lines)
 
 
 def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash", temperature=0.3):
-    r = httpx.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        params={"key": api_key},
-        json={
-            "system_instruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_message}]}],
-            "generationConfig": {"temperature": temperature},
-        },
-        timeout=120,
-    )
-    r.raise_for_status()
-    data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {"temperature": temperature},
+    }
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = httpx.post(url, params={"key": api_key}, json=body, timeout=120)
+            if r.status_code == 429:
+                wait = float(r.headers.get("Retry-After", 10 * (attempt + 1)))
+                time.sleep(min(wait, 30))
+                continue
+            if r.status_code in (502, 503, 504) and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            candidate = data.get("candidates", [{}])[0]
+            finish = candidate.get("finishReason", "STOP")
+            if finish == "SAFETY":
+                raise ValueError(
+                    "Gemini заблокировал ответ фильтром безопасности (finishReason=SAFETY). "
+                    "Попробуйте переформулировать тему или выбрать другую модель."
+                )
+            if finish == "MAX_TOKENS":
+                # Частичный ответ — вернём что есть, дальше в коде проверим длину
+                parts = (candidate.get("content") or {}).get("parts", [])
+                return parts[0].get("text", "") if parts else ""
+            parts = (candidate.get("content") or {}).get("parts", [])
+            text = parts[0].get("text", "") if parts else ""
+            return text
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2 and "503" in str(exc):
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+    raise last_exc
 
 
 def call_polza(system_prompt, user_message, api_key, model, temperature=0.3):
-    """Polza.ai — агрегатор моделей с OpenAI-совместимым API.
-    Формат model: 'provider/model', например 'openai/gpt-4o', 'anthropic/claude-3.7-sonnet'."""
-    r = httpx.post(
-        "https://polza.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-        },
-        timeout=120,
-    )
-    r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"]
+    """Polza.ai — агрегатор моделей с OpenAI-совместимым API."""
+    body = {
+        "model": model, "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+    }
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = httpx.post(
+                "https://polza.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=body, timeout=120,
+            )
+            if r.status_code == 429:
+                wait = float(r.headers.get("Retry-After", 10 * (attempt + 1)))
+                time.sleep(min(wait, 30))
+                continue
+            if r.status_code in (502, 503, 504) and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2 and "503" in str(exc):
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+    raise last_exc
 
 
 def call_llm(provider, model_id, system_prompt, user_message, api_key, temperature=0.3):
@@ -827,8 +816,7 @@ with st.sidebar:
     key_label = "Google AI Studio" if provider == "Google Gemini" else "Polza.ai"
     api_key = st.text_input(
         f"API-ключ {key_label}",
-        type="password",
-        help="Ключ не сохраняется — используется только для этого запроса в этой сессии.",
+                help="Ключ не сохраняется — используется только для этого запроса в этой сессии.",
     )
 
     model_id = None
@@ -866,9 +854,7 @@ with st.sidebar:
 
     selected_sources = st.multiselect(
         "Выберите базы", list(SOURCES.keys()),
-        default=["PubMed / NCBI (медицина, химия, биология)",
-                 "OpenAIRE (85M+ открытых публикаций, без ключа)",
-                 "Crossref (метаданные DOI + Unpaywall)"],
+        default=list(SOURCES.keys()),
     )
     per_source = st.slider("Источников на каждую базу", 2, 10, 4)
     check_oa = st.checkbox(
@@ -876,17 +862,7 @@ with st.sidebar:
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
     )
 
-    if "Semantic Scholar (200M+ работ, опц. ключ)" in selected_sources:
-        ss_key_input = st.text_input(
-            "API-ключ Semantic Scholar (необязательно)",
-            type="password",
-            help="Без ключа Semantic Scholar даёт ~1 запрос/сек — "
-                 "с общего IP Streamlit Cloud это вызывает 429. "
-                 "Бесплатный ключ: semanticscholar.org/product/api → Request API Key. "
-                 "Повышает лимит до ~10 req/s.",
-        )
-        if ss_key_input.strip():
-            st.session_state["ss_api_key"] = ss_key_input.strip()
+
 
     # Все источники теперь в SOURCES, PATENT_SOURCES оставлен пустым
     patent_credentials = {}
@@ -960,32 +936,66 @@ with tab1:
             for i, it in enumerate(all_items, 1):
                 st.markdown(f"**[{i}] {it['title']}** ({it['year']}) — *{it['source']}*  \n{it['url']}")
 
-        with st.spinner("ИИ формирует обзор литературы…"):
+        with st.spinner("ИИ формирует обзор литературы… (может занять до 1 мин)"):
             user_msg = build_user_message(topic, all_items)
             try:
                 active_prompt = st.session_state.get("system_prompt", REVIEW_SYSTEM_PROMPT)
                 review = call_llm(provider, model_id, active_prompt, user_msg, api_key, temperature=temperature)
             except Exception as exc:
-                st.error(f"Ошибка обращения к модели: {exc}")
+                err_str = str(exc)
+                if "503" in err_str:
+                    st.error(
+                        f"❌ Сервер модели временно недоступен (503) — попробуйте нажать "
+                        f"«Сформировать обзор» ещё раз через 10–20 секунд. "
+                        f"Это временный сбой на стороне провайдера, не проблема приложения."
+                    )
+                elif "429" in err_str:
+                    st.error(
+                        f"❌ Превышен лимит запросов к модели (429). "
+                        f"Подождите 30–60 секунд и повторите."
+                    )
+                else:
+                    st.error(f"❌ Ошибка обращения к модели: {exc}")
                 st.stop()
 
         # Проверяем что обзор реально сформирован (не пустая строка)
         if not review or len(review.strip()) < 300:
             n_with_abstract = sum(1 for it in all_items if it.get("abstract","").strip())
             if n_with_abstract == 0:
-                st.error(
-                    "❌ Ни один источник не вернул аннотацию — модель не может сформировать "
-                    "содержательный обзор из пустых полей. "
-                    "Попробуйте: добавить Europe PMC / Semantic Scholar / arXiv (они возвращают "
-                    "полные аннотации), или сформулировать тему на английском языке для лучшего "
-                    "покрытия в международных базах."
+                st.warning(
+                    "⚠️ Источники найдены, но аннотации пустые. "
+                    "Пробую сформировать обзор только по заголовкам..."
                 )
             else:
+                st.warning("⚠️ Модель вернула слишком короткий ответ. Пробую ещё раз...")
+            # Авто-повтор: запасной промт + temperature 0.7
+            FALLBACK_PROMPT = (
+                "You are a scientific summarizer. Write a concise literature review in Russian "
+                "based strictly on the provided sources. Include specific substances, formulas, "
+                "quantities, and methods mentioned in abstracts. Use [n] citations. Structure: "
+                "## Введение / ## Обзор литературы / ## Выводы / ## Список литературы. "
+                "Even if abstracts are empty, write based on titles and authors. "
+                "NEVER return an empty or very short response. Minimum 400 words."
+            )
+            try:
+                with st.spinner("Повторная генерация с запасным промтом..."):
+                    review = call_llm(
+                        provider, model_id, FALLBACK_PROMPT,
+                        build_user_message(topic, all_items),
+                        api_key, temperature=0.7,
+                    )
+            except Exception as exc:
+                review = ""
+            if not review or len(review.strip()) < 200:
                 st.error(
-                    "❌ Модель вернула пустой ответ. Попробуйте: повысить температуру (0.5–0.7), "
-                    "выбрать другую модель, или уточнить тему."
+                    "❌ Модель не смогла сформировать обзор.\n\n"
+                    f"Найдено источников: {len(all_items)}, с аннотацией: {n_with_abstract}.\n\n"
+                    "**Возможные причины:**\n"
+                    "- Тема слишком специфична и источники не найдены — попробуйте тему на английском\n"
+                    "- Все найденные источники отфильтрованы как нерелевантные — выберите другие базы\n"
+                    "- Gemini заблокировал запрос фильтром безопасности — попробуйте Polza.ai или другую модель"
                 )
-            st.stop()
+                st.stop()
 
         st.success("Обзор готов!")
         st.markdown(review)
@@ -1000,7 +1010,7 @@ with tab1:
 
     st.divider()
     st.caption(
-        "Демо-версия. Источники: Europe PMC, Semantic Scholar, Crossref, arXiv, DOAJ, USPTO PatentsView. "
+        "Демо-версия. Источники: PubMed / NCBI, Europe PMC, OpenAIRE, Crossref, DOAJ, arXiv, Роспатент. "
         "Полный список используемых баз и логика проверки цитирования — в промт-шаблоне проекта."
     )
 
