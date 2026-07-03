@@ -223,7 +223,7 @@ def search_doaj(query, max_results=5):
         from urllib.parse import quote
         r = _get(
             f"https://doaj.org/api/search/articles/{quote(query)}",
-            params={"pageSize": max_results}, timeout=20,
+            params={"page_size": max_results}, timeout=20,
         )
         r.raise_for_status()
         items = []
