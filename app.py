@@ -852,8 +852,9 @@ with st.sidebar:
     if contact_email_input.strip():
         CONTACT_EMAIL = contact_email_input.strip()
 
+    all_source_names = list(SOURCES.keys()) + list(PATENT_SOURCES.keys())
     selected_sources = st.multiselect(
-        "Выберите базы", list(SOURCES.keys()),
+        "Выберите базы", all_source_names,
         default=list(SOURCES.keys()),
     )
     per_source = st.slider("Источников на каждую базу", 2, 10, 4)
@@ -862,10 +863,25 @@ with st.sidebar:
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
     )
 
-
-
-    # Все источники теперь в SOURCES, PATENT_SOURCES оставлен пустым
+    # Поля для ключей выбранных патентных источников
+    selected_patent_sources = [s for s in selected_sources if s in PATENT_SOURCES]
     patent_credentials = {}
+    if selected_patent_sources:
+        st.divider()
+        st.subheader("Ключи патентных API")
+        st.caption(
+            "Для выбранных патентных баз нужен свой ключ. "
+            "Без ключа источник будет пропущен при формировании обзора."
+        )
+        for name in selected_patent_sources:
+            _, cred_fields = PATENT_SOURCES[name]
+            with st.expander(name, expanded=True):
+                values = {}
+                for field_label, session_key in cred_fields:
+                    values[session_key] = st.text_input(
+                        field_label, key=f"cred_{session_key}",
+                    )
+                patent_credentials[name] = values
 
 
 tab1, tab2 = st.tabs(["📚 Обзор", "⚙️ Настройка промта"])
@@ -916,6 +932,14 @@ with tab1:
             api_query = queries["en"] if name in ENGLISH_CENTRIC else queries["ru"]
             if name in SOURCES:
                 found = SOURCES[name](api_query, per_source)
+                all_items.extend(found)
+            elif name in PATENT_SOURCES:
+                fn, cred_fields = PATENT_SOURCES[name]
+                creds = patent_credentials.get(name, {})
+                args = [creds.get(session_key, "") for _, session_key in cred_fields]
+                found, err = fn(api_query, per_source, *args)
+                if err:
+                    st.warning(err)
                 all_items.extend(found)
         progress.progress(1.0, text="Поиск завершён")
 
