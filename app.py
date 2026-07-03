@@ -65,7 +65,7 @@ def _request_with_retry(method, url, retries=3, backoff=1.5, **kwargs):
                 wait = float(r.headers.get("Retry-After", backoff * (attempt + 1) * 2))
                 time.sleep(min(wait, 15))
                 continue
-            if r.status_code in (502, 503, 504) and attempt < retries:
+            if r.status_code in (500, 502, 503, 504) and attempt < retries:
                 time.sleep(backoff * (attempt + 1))
                 continue
             if r.status_code >= 400:
@@ -516,7 +516,8 @@ ENGLISH_CENTRIC = {
 }
 
 
-def translate_topic(topic: str, api_key: str, provider: str, model_id: str) -> dict:
+def translate_topic(topic: str, api_key: str, provider: str, model_id: str,
+                    local_base_url: str = "") -> dict:
     """Переводит тему на русский и английский (сохраняет исходный смысл целиком).
     В отличие от прошлой версии — не пытается «извлечь ключевые термины», потому что
     это выкидывает контекст (при теме «Сверхкритическая вода. Тренды 2023-2026»
@@ -537,7 +538,8 @@ def translate_topic(topic: str, api_key: str, provider: str, model_id: str) -> d
         "ТОЛЬКО JSON."
     )
     try:
-        raw = call_llm(provider, model_id, system, topic, api_key, temperature=0.0)
+        raw = call_llm(provider, model_id, system, topic, api_key, temperature=0.0,
+                       local_base_url=local_base_url)
         import json as _json, re as _re
         clean = _re.sub(r"```[a-z]*", "", raw).strip().strip("`")
         parsed = _json.loads(clean)
@@ -551,36 +553,17 @@ def translate_topic(topic: str, api_key: str, provider: str, model_id: str) -> d
 
 # ============================== ФИЛЬТР РЕЛЕВАНТНОСТИ (embeddings) ==============================
 
-def _gemini_embed(texts: list, api_key: str, model_id: str,
-                  task_type: str = "SEMANTIC_SIMILARITY") -> list:
-    """Пакетный вызов Gemini embedContent для списка текстов.
-    model_id — например 'text-embedding-004' или 'gemini-embedding-001'."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:batchEmbedContents"
-    body = {
-        "requests": [
-            {
-                "model": f"models/{model_id}",
-                "content": {"parts": [{"text": t}]},
-                "taskType": task_type,
-            }
-            for t in texts
-        ]
-    }
-    r = httpx.post(url, params={"key": api_key}, json=body, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return [emb["values"] for emb in data.get("embeddings", [])]
-
-
-def _polza_embed(texts: list, api_key: str, model_id: str) -> list:
-    """Polza.ai embedding endpoint — OpenAI-совместимый.
-    model_id — например 'openai/text-embedding-3-large' или 'google/gemini-embedding-001'."""
+def _openai_compat_embed(base_url: str, texts: list, model_id: str, api_key: str = "") -> list:
+    """Универсальный OpenAI-совместимый embeddings endpoint.
+    Работает и для Polza.ai (https://polza.ai/api/v1), и для локального
+    сервера (например http://localhost:11434/v1 у Ollama, http://localhost:1234/v1
+    у LM Studio) — протокол идентичен, отличается только base_url и наличие ключа."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     r = httpx.post(
-        "https://polza.ai/api/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        f"{base_url.rstrip('/')}/embeddings",
+        headers=headers,
         json={"model": model_id, "input": texts},
         timeout=30,
     )
@@ -591,11 +574,12 @@ def _polza_embed(texts: list, api_key: str, model_id: str) -> list:
     return [item["embedding"] for item in result]
 
 
-def _embed(provider: str, texts: list, api_key: str, model_id: str) -> list:
+def _embed(provider: str, texts: list, api_key: str, model_id: str,
+          local_base_url: str = "") -> list:
     """Универсальный dispatcher по провайдеру эмбеддингов."""
-    if provider == "Google Gemini":
-        return _gemini_embed(texts, api_key, model_id)
-    return _polza_embed(texts, api_key, model_id)
+    if provider == "Локальный API (OpenAI-совместимый)":
+        return _openai_compat_embed(local_base_url, texts, model_id, api_key)
+    return _openai_compat_embed("https://polza.ai/api/v1", texts, model_id, api_key)
 
 
 def _cosine_similarity(v1: list, v2: list) -> float:
@@ -610,7 +594,7 @@ def _cosine_similarity(v1: list, v2: list) -> float:
 
 def filter_by_relevance(topic_translated: dict, items: list, provider: str,
                         api_key: str, embedding_model: str,
-                        threshold=None) -> tuple:
+                        threshold=None, local_base_url: str = "") -> tuple:
     """Сортирует статьи по косинусной близости к теме (по эмбеддингам).
     Возвращает (filtered_items, scored_items).
 
@@ -634,7 +618,8 @@ def filter_by_relevance(topic_translated: dict, items: list, provider: str,
     all_texts = topic_texts + article_texts
 
     try:
-        vectors = _embed(provider, all_texts, api_key, embedding_model)
+        vectors = _embed(provider, all_texts, api_key, embedding_model,
+                         local_base_url=local_base_url)
     except Exception as exc:
         st.warning(
             f"⚠️ Не удалось вычислить эмбеддинги ({exc}). "
@@ -751,108 +736,72 @@ def build_user_message(topic, items):
 
 
 
-def build_source_based_review(topic: str, items: list, reason: str = "") -> str:
-    """Детерминированный резервный обзор без LLM.
-    Нужен, чтобы приложение не падало, если модель вернула пустой/слишком короткий ответ."""
-    def _short(text, limit=500):
-        text = (text or "").strip().replace("\n", " ")
-        return text if len(text) <= limit else text[:limit].rstrip() + "…"
+def call_openai_compat(system_prompt, user_message, base_url, model, temperature=0.3, api_key=""):
+    """Универсальный вызов OpenAI-совместимого /chat/completions.
+    Работает и для Polza.ai (base_url='https://polza.ai/api/v1'), и для локального
+    сервера (base_url='http://localhost:11434/v1' у Ollama, 'http://localhost:1234/v1'
+    у LM Studio, 'http://localhost:8000/v1' у vLLM/llama.cpp server и т.п.).
 
-    with_abstract = [(i, it) for i, it in enumerate(items, 1) if (it.get("abstract") or "").strip()]
-    without_abstract = [(i, it) for i, it in enumerate(items, 1) if not (it.get("abstract") or "").strip()]
+    ВАЖНО: у части моделей (o1/o3/gpt-5-reasoning, deepseek-reasoner и подобных
+    "рассуждающих", включая некоторые локальные) скрытые reasoning-токены считаются
+    ВНУТРИ max_tokens. При недостаточном лимите модель может потратить весь бюджет на
+    рассуждение и вернуть finish_reason="length" с ПУСТЫМ content. Поэтому начинаем
+    со щедрого лимита и, если всё равно упёрлись в пустой ответ, эскалируем и в конце
+    выдаём понятную ошибку вместо тихого возврата пустой строки."""
+    max_tokens = 8192
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
-    lines = [
-        "## Введение",
-        f"Тема обзора: {topic}. Ниже приведён резервный черновик, сформированный автоматически по найденным источникам, потому что LLM не вернула полноценный текст.",
-        f"В подборке {len(items)} источников; аннотации доступны у {len(with_abstract)} источников. Содержательные выводы ниже опираются преимущественно на источники с аннотациями.",
-        "",
-        "## Обзор литературы",
-    ]
-
-    if reason:
-        lines.extend([
-            "### Техническое ограничение генерации",
-            f"Основная генерация не дала полного результата: {reason}. Поэтому этот раздел является техническим черновиком, а не финальным научным текстом.",
-            "",
-        ])
-
-    if with_abstract:
-        lines.append("### Источники с аннотациями")
-        for n, it in with_abstract:
-            title = it.get("title", "(без названия)")
-            year = it.get("year", "н/д")
-            source = it.get("source", "н/д")
-            abstract = _short(it.get("abstract", ""), 650)
-            lines.append(f"Источник [{n}] — «{title}» ({year}, {source}) — содержит следующие сведения: {abstract} [{n}]")
-        lines.append("")
-
-    if without_abstract:
-        lines.append("### Источники без аннотаций")
-        for n, it in without_abstract:
-            title = it.get("title", "(без названия)")
-            year = it.get("year", "н/д")
-            source = it.get("source", "н/д")
-            lines.append(f"Источник [{n}] — «{title}» ({year}, {source}) включён в подборку, но аннотация недоступна; по нему нельзя делать подробные содержательные выводы без просмотра полного текста или карточки публикации [{n}].")
-        lines.append("")
-
-    cited = ", ".join(f"[{n}]" for n, _ in with_abstract[:12]) or "источники с аннотациями отсутствуют"
-    lines.extend([
-        "## Выводы и направления дальнейших исследований",
-        f"- Для полноценного обзора нужно вручную проверить источники с наиболее информативными аннотациями: {cited}.",
-        "- Источники без аннотаций следует использовать осторожно: они пригодны для расширения библиографии, но не для сильных содержательных выводов без полного текста.",
-        "- Рекомендация: повторить генерацию с меньшим числом источников или с другой моделью, если нужен связный аналитический текст вместо технического черновика.",
-        "",
-        "## Список литературы",
-    ])
-
-    for i, it in enumerate(items, 1):
-        authors = it.get("authors") or "н/д"
-        title = it.get("title") or "(без названия)"
-        year = it.get("year") or "н/д"
-        source = it.get("source") or "н/д"
-        url = it.get("url") or "н/д"
-        lines.append(f"[{i}] {authors}. {title}. {year}. {source}. {url}")
-
-    return "\n".join(lines)
-
-
-def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash", temperature=0.3):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    body = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
-        "generationConfig": {
+    def _build_body(mt):
+        return {
+            "model": model,
             "temperature": temperature,
-            "maxOutputTokens": 8192,
-        },
-    }
+            "max_tokens": mt,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+        }
+
+    body = _build_body(max_tokens)
     last_exc = None
     for attempt in range(3):
         try:
-            r = httpx.post(url, params={"key": api_key}, json=body, timeout=120)
+            r = httpx.post(url, headers=headers, json=body, timeout=180)
             if r.status_code == 429:
                 wait = float(r.headers.get("Retry-After", 10 * (attempt + 1)))
                 time.sleep(min(wait, 30))
                 continue
-            if r.status_code in (502, 503, 504) and attempt < 2:
+            if r.status_code in (500, 502, 503, 504) and attempt < 2:
                 time.sleep(5 * (attempt + 1))
                 continue
             r.raise_for_status()
             data = r.json()
-            candidate = data.get("candidates", [{}])[0]
-            finish = candidate.get("finishReason", "STOP")
-            if finish == "SAFETY":
+            choice = data.get("choices", [{}])[0]
+            finish_reason = choice.get("finish_reason", "stop")
+            message = choice.get("message", {}) or {}
+            content = message.get("content") or ""
+            # Некоторые reasoning-модели кладут рассуждение в отдельное поле
+            # (reasoning/reasoning_content) — это ожидаемо и не является ошибкой,
+            # нас интересует только видимый content.
+            if finish_reason == "length" and not content.strip():
+                if attempt < 2:
+                    max_tokens = min(max_tokens * 2, 32768)
+                    body = _build_body(max_tokens)
+                    continue
                 raise ValueError(
-                    "Gemini заблокировал ответ фильтром безопасности (finishReason=SAFETY). "
+                    "Модель исчерпала лимит токенов на внутренние рассуждения и не "
+                    "успела вывести видимый текст (finish_reason=length, content пуст). "
+                    "Попробуйте модель без reasoning или сократите число источников на базу."
+                )
+            if finish_reason == "content_filter":
+                raise ValueError(
+                    "Модель заблокировала ответ фильтром контента (finish_reason=content_filter). "
                     "Попробуйте переформулировать тему или выбрать другую модель."
                 )
-            if finish == "MAX_TOKENS":
-                # Частичный ответ — вернём что есть, дальше в коде проверим длину
-                parts = (candidate.get("content") or {}).get("parts", [])
-                return parts[0].get("text", "") if parts else ""
-            parts = (candidate.get("content") or {}).get("parts", [])
-            text = parts[0].get("text", "") if parts else ""
-            return text
+            return content
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_exc = exc
             if attempt < 2:
@@ -861,79 +810,23 @@ def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash", 
             raise
         except Exception as exc:
             last_exc = exc
-            if attempt < 2 and "503" in str(exc):
+            if attempt < 2 and any(code in str(exc) for code in ("500", "503")):
                 time.sleep(5 * (attempt + 1))
                 continue
             raise
     raise last_exc
 
 
-def call_polza(system_prompt, user_message, api_key, model, temperature=0.3):
-    """Polza.ai — агрегатор моделей с OpenAI-совместимым API."""
-    body = {
-        "model": model,
-        "temperature": temperature,
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-    }
-    last_exc = None
-    for attempt in range(3):
-        try:
-            r = httpx.post(
-                "https://polza.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=body, timeout=120,
-            )
-            if r.status_code == 429:
-                wait = float(r.headers.get("Retry-After", 10 * (attempt + 1)))
-                time.sleep(min(wait, 30))
-                continue
-            if r.status_code in (502, 503, 504) and attempt < 2:
-                time.sleep(5 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            last_exc = exc
-            if attempt < 2:
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise
-        except Exception as exc:
-            last_exc = exc
-            if attempt < 2 and "503" in str(exc):
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise
-    raise last_exc
-
-
-def call_llm(provider, model_id, system_prompt, user_message, api_key, temperature=0.3):
-    if provider == "Google Gemini":
-        return call_gemini(system_prompt, user_message, api_key, model=model_id, temperature=temperature)
-    return call_polza(system_prompt, user_message, api_key, model=model_id, temperature=temperature)
+def call_llm(provider, model_id, system_prompt, user_message, api_key, temperature=0.3,
+            local_base_url: str = ""):
+    if provider == "Локальный API (OpenAI-совместимый)":
+        return call_openai_compat(system_prompt, user_message, local_base_url, model_id,
+                                  temperature=temperature, api_key=api_key)
+    return call_openai_compat(system_prompt, user_message, "https://polza.ai/api/v1",
+                              model_id, temperature=temperature, api_key=api_key)
 
 
 # ------------------------- Загрузка списка доступных моделей -------------------------
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_gemini_models(api_key):
-    """Список моделей Gemini, поддерживающих generateContent."""
-    r = httpx.get(
-        "https://generativelanguage.googleapis.com/v1beta/models",
-        params={"key": api_key}, timeout=20,
-    )
-    r.raise_for_status()
-    out = []
-    for m in r.json().get("models", []):
-        if "generateContent" in (m.get("supportedGenerationMethods") or []):
-            model_id = m["name"].removeprefix("models/")
-            out.append((model_id, m.get("displayName") or model_id))
-    return out
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -968,32 +861,34 @@ def fetch_polza_embedding_models(api_key):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_gemini_embedding_models(api_key):
-    """Список embedding-моделей у Google Gemini.
-    Отфильтровываем модели, поддерживающие embedContent."""
-    r = httpx.get(
-        "https://generativelanguage.googleapis.com/v1beta/models",
-        params={"key": api_key}, timeout=20,
-    )
+def fetch_local_models(base_url, api_key=""):
+    """Список моделей локального сервера через OpenAI-совместимый GET /models.
+    Работает с Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1),
+    vLLM / llama.cpp server (http://localhost:8000/v1) и подобными.
+    Локальные серверы обычно НЕ различают chat/embedding модели в списке —
+    возвращаем всё, пользователь выбирает нужную сам."""
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    r = httpx.get(f"{base_url.rstrip('/')}/models", headers=headers, timeout=15)
     r.raise_for_status()
     out = []
-    for m in r.json().get("models", []):
-        methods = m.get("supportedGenerationMethods") or []
-        if "embedContent" in methods or "batchEmbedContents" in methods:
-            model_id = m["name"].removeprefix("models/")
-            out.append((model_id, m.get("displayName") or model_id))
+    for m in r.json().get("data", []):
+        model_id = m.get("id", "")
+        if model_id:
+            out.append((model_id, model_id))
     return out
 
 
-def fetch_embedding_models(provider, api_key):
-    if provider == "Google Gemini":
-        return fetch_gemini_embedding_models(api_key)
+def fetch_embedding_models(provider, api_key, local_base_url: str = ""):
+    if provider == "Локальный API (OpenAI-совместимый)":
+        return fetch_local_models(local_base_url, api_key)
     return fetch_polza_embedding_models(api_key)
 
 
-def fetch_models(provider, api_key):
-    if provider == "Google Gemini":
-        return fetch_gemini_models(api_key)
+def fetch_models(provider, api_key, local_base_url: str = ""):
+    if provider == "Локальный API (OpenAI-совместимый)":
+        return fetch_local_models(local_base_url, api_key)
     return fetch_polza_models(api_key)
 
 
@@ -1040,71 +935,137 @@ with st.sidebar:
 
     provider = st.selectbox(
         "Провайдер LLM",
-        ["Google Gemini", "Polza.ai (агрегатор моделей)"],
-        help="Google Gemini — бесплатный тариф от Google. "
-             "Polza.ai — платный (в рублях) агрегатор, даёт доступ к сотням моделей "
-             "(OpenAI, Anthropic, Google и др.) через один ключ.",
-    )
-    key_label = "Google AI Studio" if provider == "Google Gemini" else "Polza.ai"
-    api_key = st.text_input(
-        f"API-ключ {key_label}",
-                help="Ключ не сохраняется — используется только для этого запроса в этой сессии.",
+        ["Polza.ai (агрегатор моделей)", "Локальный API (OpenAI-совместимый)"],
+        help="Polza.ai — платный (в рублях) агрегатор, доступ к сотням моделей "
+             "(OpenAI, Anthropic, Google и др.) через один ключ. "
+             "Локальный API — свой сервер на этом же компьютере или в сети "
+             "(Ollama, LM Studio, vLLM, llama.cpp server и т.п.), без отправки "
+             "данных во внешние облака.",
     )
 
+    local_base_url = ""
+    api_key = ""
     model_id = None
-    if api_key:
-        try:
-            with st.spinner("Загружаю список доступных моделей…"):
-                model_options = fetch_models(provider, api_key)
-        except Exception as exc:
+    embedding_model_id = None
+
+    if provider == "Локальный API (OpenAI-совместимый)":
+        local_base_url = st.text_input(
+            "Base URL сервера",
+            placeholder="http://localhost:11434/v1",
+            help="Адрес OpenAI-совместимого API. Примеры: Ollama — "
+                 "http://localhost:11434/v1, LM Studio — http://localhost:1234/v1, "
+                 "vLLM/llama.cpp server — http://localhost:8000/v1. "
+                 "Если Streamlit работает не на этом компьютере (например в облаке), "
+                 "укажите адрес, доступный по сети, или проброшенный туннель."
+        )
+        api_key = st.text_input(
+            "API-ключ (необязательно)",
+            help="Большинству локальных серверов ключ не нужен — оставьте пустым, "
+                 "если сервер его не требует.",
+        )
+
+        if local_base_url:
             model_options = []
-            st.error(f"Не удалось загрузить список моделей: {exc}")
+            try:
+                with st.spinner("Загружаю список моделей с локального сервера…"):
+                    model_options = fetch_models(provider, api_key, local_base_url=local_base_url)
+            except Exception as exc:
+                st.caption(f"⚠️ Не удалось получить список моделей автоматически ({exc}). "
+                           f"Впишите название модели вручную ниже.")
 
-        if model_options:
-            labels = [f"{name}  ·  {mid}" if name != mid else mid for mid, name in model_options]
-            idx = st.selectbox(
-                "Модель", range(len(model_options)), format_func=lambda i: labels[i]
-            )
-            model_id = model_options[idx][0]
-            st.caption(f"Доступно моделей: {len(model_options)}")
-        else:
-            st.warning("Список моделей пуст — проверьте ключ.")
+            if model_options:
+                labels = [mid for mid, _ in model_options]
+                idx = st.selectbox("Модель", range(len(model_options)),
+                                   format_func=lambda i: labels[i])
+                model_id = model_options[idx][0]
+            else:
+                model_id = st.text_input(
+                    "Название модели (вручную)",
+                    placeholder="например: llama3.1, qwen2.5:14b, mistral-nemo",
+                    help="Имя модели, как оно указано на локальном сервере "
+                         "(команда 'ollama list' и т.п.)."
+                ) or None
 
-        # Модель эмбеддингов для фильтра релевантности
-        embedding_model_id = None
-        try:
-            with st.spinner("Загружаю список embedding-моделей…"):
-                emb_options = fetch_embedding_models(provider, api_key)
-        except Exception as exc:
             emb_options = []
-            st.caption(f"⚠️ Embedding-модели недоступны: {exc}")
+            try:
+                emb_options = fetch_models(provider, api_key, local_base_url=local_base_url)
+            except Exception:
+                pass
+            if emb_options:
+                emb_labels = [mid for mid, _ in emb_options]
+                emb_idx = st.selectbox(
+                    "🎯 Модель эмбеддингов (необязательно — фильтр релевантности)",
+                    ["— не использовать —"] + emb_labels,
+                    help="Если на сервере есть embedding-модель (например nomic-embed-text) — "
+                         "выберите её для фильтрации источников по релевантности. "
+                         "Без неё фильтр просто не будет применяться."
+                )
+                embedding_model_id = None if emb_idx == "— не использовать —" else emb_idx
+            else:
+                embedding_model_id = st.text_input(
+                    "🎯 Модель эмбеддингов (необязательно, вручную)",
+                    placeholder="например: nomic-embed-text",
+                    help="Оставьте пустым, чтобы пропустить фильтр релевантности."
+                ) or None
+        else:
+            st.caption("Укажите base URL локального сервера, чтобы продолжить.")
 
-        if emb_options:
-            emb_labels = [f"{name}  ·  {mid}" if name != mid else mid for mid, name in emb_options]
-            # Пробуем найти дефолт — предпочитаем text-embedding-3-small или text-embedding-004
-            default_idx = 0
-            for pref in ("text-embedding-3-small", "text-embedding-004",
-                         "openai/text-embedding-3-small", "google/gemini-embedding-001",
-                         "gemini-embedding-001"):
-                for i, (mid, _) in enumerate(emb_options):
-                    if mid.endswith(pref) or mid == pref:
-                        default_idx = i
-                        break
-                else:
-                    continue
-                break
-            emb_idx = st.selectbox(
-                "🎯 Модель эмбеддингов (фильтр релевантности)",
-                range(len(emb_options)),
-                index=default_idx,
-                format_func=lambda i: emb_labels[i],
-                help="Используется для оценки близости найденных статей к теме. "
-                     "Меньшие модели быстрее и дешевле, большие — точнее."
-            )
-            embedding_model_id = emb_options[emb_idx][0]
-    else:
-        st.caption("Введите API-ключ, чтобы загрузить список моделей.")
-        embedding_model_id = None
+    else:  # Polza.ai
+        api_key = st.text_input(
+            "API-ключ Polza.ai",
+            help="Ключ не сохраняется — используется только для этого запроса в этой сессии.",
+        )
+
+        if api_key:
+            try:
+                with st.spinner("Загружаю список доступных моделей…"):
+                    model_options = fetch_models(provider, api_key)
+            except Exception as exc:
+                model_options = []
+                st.error(f"Не удалось загрузить список моделей: {exc}")
+
+            if model_options:
+                labels = [f"{name}  ·  {mid}" if name != mid else mid for mid, name in model_options]
+                idx = st.selectbox(
+                    "Модель", range(len(model_options)), format_func=lambda i: labels[i]
+                )
+                model_id = model_options[idx][0]
+                st.caption(f"Доступно моделей: {len(model_options)}")
+            else:
+                st.warning("Список моделей пуст — проверьте ключ.")
+
+            # Модель эмбеддингов для фильтра релевантности
+            try:
+                with st.spinner("Загружаю список embedding-моделей…"):
+                    emb_options = fetch_embedding_models(provider, api_key)
+            except Exception as exc:
+                emb_options = []
+                st.caption(f"⚠️ Embedding-модели недоступны: {exc}")
+
+            if emb_options:
+                emb_labels = [f"{name}  ·  {mid}" if name != mid else mid for mid, name in emb_options]
+                # Пробуем найти дефолт — предпочитаем text-embedding-3-small
+                default_idx = 0
+                for pref in ("text-embedding-3-small", "openai/text-embedding-3-small",
+                             "google/gemini-embedding-001", "gemini-embedding-001"):
+                    for i, (mid, _) in enumerate(emb_options):
+                        if mid.endswith(pref) or mid == pref:
+                            default_idx = i
+                            break
+                    else:
+                        continue
+                    break
+                emb_idx = st.selectbox(
+                    "🎯 Модель эмбеддингов (фильтр релевантности)",
+                    range(len(emb_options)),
+                    index=default_idx,
+                    format_func=lambda i: emb_labels[i],
+                    help="Используется для оценки близости найденных статей к теме. "
+                         "Меньшие модели быстрее и дешевле, большие — точнее."
+                )
+                embedding_model_id = emb_options[emb_idx][0]
+        else:
+            st.caption("Введите API-ключ, чтобы загрузить список моделей.")
 
     st.divider()
     st.subheader("Источники для поиска")
@@ -1210,12 +1171,16 @@ with tab1:
         height=100,
     ).strip()
 
+    key_provided_or_not_needed = bool(api_key) or provider == "Локальный API (OpenAI-совместимый)"
+
     go = st.button(
         "🔎 Сформировать обзор", type="primary",
-        disabled=not (topic and api_key and model_id and selected_sources),
+        disabled=not (topic and key_provided_or_not_needed and model_id and selected_sources),
     )
 
-    if not api_key:
+    if provider == "Локальный API (OpenAI-совместимый)" and not local_base_url:
+        st.info("Укажите Base URL локального сервера в боковой панели, чтобы начать.")
+    elif not key_provided_or_not_needed:
         st.info("Введите API-ключ в боковой панели, чтобы начать.")
     elif not model_id:
         st.info("Выберите модель в боковой панели, чтобы начать.")
@@ -1223,7 +1188,8 @@ with tab1:
     if go:
         # Шаг 0: переводим тему на русский и английский (сохраняя весь смысл)
         with st.spinner("🌐 Перевожу тему на нужные языки для поиска…"):
-            queries = translate_topic(topic, api_key, provider, model_id)
+            queries = translate_topic(topic, api_key, provider, model_id,
+                                      local_base_url=local_base_url)
 
         with st.expander("🌐 Тема на языках поисковых баз", expanded=False):
             st.markdown(
@@ -1266,6 +1232,7 @@ with tab1:
                     _, scored_here = filter_by_relevance(
                         queries, found, provider, api_key, embedding_model_id,
                         threshold=None,  # порог отключён — берём top-N по score
+                        local_base_url=local_base_url,
                     )
                     # scored_here уже отсортирован по убыванию score
                     top_items = [it for it, _ in scored_here[:per_source]]
@@ -1325,15 +1292,16 @@ with tab1:
             user_msg = build_user_message(topic, all_items)
             try:
                 active_prompt = st.session_state.get("system_prompt", REVIEW_SYSTEM_PROMPT)
-                review = call_llm(provider, model_id, active_prompt, user_msg, api_key, temperature=temperature)
+                review = call_llm(provider, model_id, active_prompt, user_msg, api_key,
+                                  temperature=temperature, local_base_url=local_base_url)
             except Exception as exc:
                 review = ""
                 llm_problem = f"ошибка основного вызова модели: {exc}"
                 st.warning(f"⚠️ Основной вызов модели не дал результата: {exc}")
 
-        # Проверяем, что обзор реально сформирован. Если модель вернула пустой/короткий
-        # ответ, делаем второй вызов. Если и он не сработал — НЕ останавливаем приложение,
-        # а формируем резервный обзор по найденным источникам.
+        # Если модель вернула пустой/короткий ответ — один автоматический повтор
+        # с более прямым промтом и низкой температурой. Если и это не помогло —
+        # честно останавливаемся с понятной причиной, а не подсовываем суррогат.
         if not review or len(review.strip()) < 300:
             first_len = len((review or "").strip())
             st.warning(
@@ -1354,24 +1322,31 @@ with tab1:
                     review = call_llm(
                         provider, model_id, FALLBACK_PROMPT,
                         build_user_message(topic, all_items),
-                        api_key, temperature=0.2,
+                        api_key, temperature=0.2, local_base_url=local_base_url,
                     )
             except Exception as exc:
                 llm_problem = f"ошибка повторного вызова модели: {exc}"
-                st.warning(f"⚠️ Повторный вызов модели тоже не дал результата: {exc}")
                 review = ""
 
             if not review or len(review.strip()) < 200:
                 final_len = len((review or "").strip())
                 reason = llm_problem or f"модель вернула только {final_len} символов"
-                st.warning(
-                    "⚠️ LLM не сформировала полноценный обзор, поэтому создан резервный "
-                    "черновик по найденным источникам. Это лучше, чем падать с ошибкой."
+                st.error(
+                    f"❌ Модель не смогла сформировать обзор даже со второй попытки.\n\n"
+                    f"**Причина:** {reason}\n\n"
+                    f"Найдено источников: {len(all_items)}.\n\n"
+                    "**Что попробовать:**\n"
+                    "- Выбрать другую модель (например без 'thinking'/'reasoning' — "
+                    "gemini-2.0-flash или обычная gpt-4o без reasoning-суффикса)\n"
+                    "- Уменьшить «Источников на каждую базу» — меньше контекста для модели\n"
+                    "- Повысить температуру, если причина не в лимите токенов\n"
+                    "- Попробовать другого провайдера LLM"
                 )
-                review = build_source_based_review(topic, all_items, reason=reason)
+                st.stop()
 
         st.success("Обзор готов!")
         st.markdown(review)
+
 
         docx_buf = build_docx(topic, review)
         st.download_button(
