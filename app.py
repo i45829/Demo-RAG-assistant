@@ -516,53 +516,168 @@ ENGLISH_CENTRIC = {
 }
 
 
-def extract_search_queries(topic: str, api_key: str, provider: str, model_id: str) -> dict:
-    """Вызывает LLM чтобы извлечь ключевые научные термины из темы на русском и английском.
-    Возвращает {"ru": "...", "en": "..."}.
-    Это самый важный шаг: без него keyword-поиск по полной фразе темы
-    находит мусор (совпадение по случайным словам вроде «тренды», «анализ», «год»)."""
+def translate_topic(topic: str, api_key: str, provider: str, model_id: str) -> dict:
+    """Переводит тему на русский и английский (сохраняет исходный смысл целиком).
+    В отличие от прошлой версии — не пытается «извлечь ключевые термины», потому что
+    это выкидывает контекст (при теме «Сверхкритическая вода. Тренды 2023-2026»
+    извлечение оставляло только «сверхкритическая вода», теряя аспект «тренды»)."""
     system = (
-        "Ты — помощник для научного поиска. "
-        "Извлеки из темы исследования 2-4 ключевых научных термина. "
+        "Ты — переводчик. Переведи тему научного исследования на русский и английский. "
+        "Сохрани ВСЕ смысловые аспекты (тренды, обзор, конкретные вещества и т.п.), "
+        "убери только годы/даты, если они есть. "
         "Верни ТОЛЬКО JSON без Markdown, без пояснений. "
-        'Схема: {"ru": "термины на русском", "en": "same in English"}. '
+        'Схема: {"ru": "тема на русском", "en": "topic in English"}. '
         "Примеры: "
-        'тема «Сверхкритическая вода. Научные тренды 2023-2026» -> {"ru": "сверхкритическая вода", "en": "supercritical water"}; '
-        'тема «Масляные дисперсии как препаративная форма для СЗР» -> {"ru": "масляные дисперсии агрохимия", "en": "oil dispersion agrochemical formulation"}. '
+        'тема «Сверхкритическая вода. Тренды 2023-2026» -> '
+        '{"ru": "Сверхкритическая вода, современные тренды исследований", '
+        '"en": "Supercritical water, current research trends"}; '
+        'тема «Масляные дисперсии как препаративная форма для СЗР» -> '
+        '{"ru": "Масляные дисперсии как препаративная форма для средств защиты растений", '
+        '"en": "Oil dispersions as formulation type for plant protection products"}. '
         "ТОЛЬКО JSON."
     )
     try:
         raw = call_llm(provider, model_id, system, topic, api_key, temperature=0.0)
         import json as _json, re as _re
-        # Убираем возможные markdown-бэктики
         clean = _re.sub(r"```[a-z]*", "", raw).strip().strip("`")
         parsed = _json.loads(clean)
         ru = str(parsed.get("ru", topic)).strip() or topic
         en = str(parsed.get("en", topic)).strip() or topic
         return {"ru": ru, "en": en}
     except Exception:
-        # Фолбэк: убираем самые частые «шумовые» слова из русского текста
-        import re as _re
-        stop_words = ["научные", "тренды", "обзор", "анализ", "исследование", "года", "год"]
-        stop_patterns = [r"20\d{2}[–\-]20\d{2}", r"20\d{2}"]
-        clean = topic
-        for sw in stop_words:
-            clean = _re.sub(sw, "", clean, flags=_re.IGNORECASE)
-        for pat in stop_patterns:
-            clean = _re.sub(pat, "", clean)
-        clean = " ".join(clean.split())  # убираем лишние пробелы
-        return {"ru": clean or topic, "en": clean or topic}
+        # Фолбэк: используем оригинальную тему в обоих полях (лучше, чем ничего)
+        return {"ru": topic, "en": topic}
+
+
+# ============================== ФИЛЬТР РЕЛЕВАНТНОСТИ (embeddings) ==============================
+
+def _gemini_embed(texts: list, api_key: str, model_id: str,
+                  task_type: str = "SEMANTIC_SIMILARITY") -> list:
+    """Пакетный вызов Gemini embedContent для списка текстов.
+    model_id — например 'text-embedding-004' или 'gemini-embedding-001'."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:batchEmbedContents"
+    body = {
+        "requests": [
+            {
+                "model": f"models/{model_id}",
+                "content": {"parts": [{"text": t}]},
+                "taskType": task_type,
+            }
+            for t in texts
+        ]
+    }
+    r = httpx.post(url, params={"key": api_key}, json=body, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return [emb["values"] for emb in data.get("embeddings", [])]
+
+
+def _polza_embed(texts: list, api_key: str, model_id: str) -> list:
+    """Polza.ai embedding endpoint — OpenAI-совместимый.
+    model_id — например 'openai/text-embedding-3-large' или 'google/gemini-embedding-001'."""
+    r = httpx.post(
+        "https://polza.ai/api/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={"model": model_id, "input": texts},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    # Ответ соответствует OpenAI: data.data — массив с полями embedding и index
+    result = sorted(data.get("data", []), key=lambda x: x.get("index", 0))
+    return [item["embedding"] for item in result]
+
+
+def _embed(provider: str, texts: list, api_key: str, model_id: str) -> list:
+    """Универсальный dispatcher по провайдеру эмбеддингов."""
+    if provider == "Google Gemini":
+        return _gemini_embed(texts, api_key, model_id)
+    return _polza_embed(texts, api_key, model_id)
+
+
+def _cosine_similarity(v1: list, v2: list) -> float:
+    """Косинусная близость двух векторов (без numpy — чистый Python)."""
+    dot = sum(a * b for a, b in zip(v1, v2))
+    n1 = sum(a * a for a in v1) ** 0.5
+    n2 = sum(b * b for b in v2) ** 0.5
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return dot / (n1 * n2)
+
+
+def filter_by_relevance(topic_translated: dict, items: list, provider: str,
+                        api_key: str, embedding_model: str,
+                        threshold: float = 0.55) -> tuple:
+    """Оставляет только статьи, косинусно близкие к теме (по эмбеддингам).
+    Возвращает (отфильтрованный список, оценки для отчёта).
+
+    threshold=0.55 подобран как разумный компромисс:
+    - <0.45: мусор проходит
+    - 0.55: отсекает явно нерелевантное, сохраняя пограничные случаи
+    - >0.65: слишком строго, теряются близкие по духу работы"""
+    if not items:
+        return items, []
+
+    # Собираем «текст статьи» — заголовок + аннотация, если есть
+    def _article_text(it):
+        parts = [it.get("title", "")]
+        if it.get("abstract"):
+            parts.append(it["abstract"])
+        return " ".join(parts)[:2000]  # ограничение по токенам эмбеддингов
+
+    # Тексты для эмбеддинга: 2 темы (ru/en) + N статей
+    topic_texts = [topic_translated["ru"], topic_translated["en"]]
+    article_texts = [_article_text(it) for it in items]
+    all_texts = topic_texts + article_texts
+
+    try:
+        vectors = _embed(provider, all_texts, api_key, embedding_model)
+    except Exception as exc:
+        st.warning(
+            f"⚠️ Не удалось вычислить эмбеддинги ({exc}). "
+            f"Фильтрация по релевантности пропущена, все статьи оставлены."
+        )
+        return items, []
+
+    if len(vectors) < 2 + len(items):
+        return items, []
+
+    topic_vec_ru = vectors[0]
+    topic_vec_en = vectors[1]
+    article_vecs = vectors[2:]
+
+    # Для каждой статьи берём максимум из близости к RU и EN версии темы
+    scored = []
+    for it, avec in zip(items, article_vecs):
+        sim_ru = _cosine_similarity(topic_vec_ru, avec)
+        sim_en = _cosine_similarity(topic_vec_en, avec)
+        score = max(sim_ru, sim_en)
+        scored.append((it, score))
+
+    # Сортируем по убыванию релевантности
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # Оставляем прошедшие порог, но не меньше 3 (даже если все близки к границе)
+    filtered = [it for it, score in scored if score >= threshold]
+    if len(filtered) < 3 and len(scored) >= 3:
+        filtered = [it for it, _ in scored[:3]]
+
+    return filtered, scored
 
 
 # ============================== СИНТЕЗ ОБЗОРА (LLM) ==============================
 
 REVIEW_SYSTEM_PROMPT = """Ты — научный аналитик, готовящий раздел «Обзор литературы» для диссертации по естественнонаучной/технической теме.
 
-ШАГ 1 — ФИЛЬТРАЦИЯ (молча, до написания текста):
-Оцени каждый источник: относится ли он к теме по СУЩЕСТВУ, а не по случайному слову.
-Если источник явно не по теме (например, экономический анализ при теме по физической химии) — исключи его полностью и молча. В итоговый текст и список литературы он не попадает. Никогда не пытайся «натянуть» нерелевантный источник на тему.
+ВАЖНО: Источники уже прошли автоматическую фильтрацию по релевантности (эмбеддинги + косинусная близость), поэтому все переданные тебе статьи заведомо связаны с темой. Твоя задача — не фильтровать, а СИНТЕЗИРОВАТЬ содержание.
 
-ШАГ 2 — НАПИСАНИЕ ОБЗОРА (по отфильтрованным источникам):
+ШАГ 1 — ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА (только для явных сбоев):
+Если конкретная статья очевидно не про тему (например, экономика/социология при теме по физической химии) — молча исключи её. В обычных случаях всё оставляй.
+
+ШАГ 2 — НАПИСАНИЕ ОБЗОРА:
 Пиши только то, что реально есть в аннотациях релевантных источников. Извлекай:
 - точные названия веществ, материалов, соединений, реагентов, методов, приборов;
 - химические формулы и обозначения — буквально как в источнике;
@@ -759,6 +874,46 @@ def fetch_polza_models(api_key):
     return out
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_polza_embedding_models(api_key):
+    """Список embedding-моделей через Polza.ai (google/gemini-embedding-001,
+    openai/text-embedding-3-large, qwen/qwen3-embedding-8b и др.)."""
+    r = httpx.get(
+        "https://polza.ai/api/v1/models",
+        params={"type": "embedding"},
+        headers={"Authorization": f"Bearer {api_key}"}, timeout=20,
+    )
+    r.raise_for_status()
+    out = []
+    for m in r.json().get("data", []):
+        out.append((m["id"], m.get("name") or m["id"]))
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_gemini_embedding_models(api_key):
+    """Список embedding-моделей у Google Gemini.
+    Отфильтровываем модели, поддерживающие embedContent."""
+    r = httpx.get(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        params={"key": api_key}, timeout=20,
+    )
+    r.raise_for_status()
+    out = []
+    for m in r.json().get("models", []):
+        methods = m.get("supportedGenerationMethods") or []
+        if "embedContent" in methods or "batchEmbedContents" in methods:
+            model_id = m["name"].removeprefix("models/")
+            out.append((model_id, m.get("displayName") or model_id))
+    return out
+
+
+def fetch_embedding_models(provider, api_key):
+    if provider == "Google Gemini":
+        return fetch_gemini_embedding_models(api_key)
+    return fetch_polza_embedding_models(api_key)
+
+
 def fetch_models(provider, api_key):
     if provider == "Google Gemini":
         return fetch_gemini_models(api_key)
@@ -837,8 +992,42 @@ with st.sidebar:
             st.caption(f"Доступно моделей: {len(model_options)}")
         else:
             st.warning("Список моделей пуст — проверьте ключ.")
+
+        # Модель эмбеддингов для фильтра релевантности
+        embedding_model_id = None
+        try:
+            with st.spinner("Загружаю список embedding-моделей…"):
+                emb_options = fetch_embedding_models(provider, api_key)
+        except Exception as exc:
+            emb_options = []
+            st.caption(f"⚠️ Embedding-модели недоступны: {exc}")
+
+        if emb_options:
+            emb_labels = [f"{name}  ·  {mid}" if name != mid else mid for mid, name in emb_options]
+            # Пробуем найти дефолт — предпочитаем text-embedding-3-small или text-embedding-004
+            default_idx = 0
+            for pref in ("text-embedding-3-small", "text-embedding-004",
+                         "openai/text-embedding-3-small", "google/gemini-embedding-001",
+                         "gemini-embedding-001"):
+                for i, (mid, _) in enumerate(emb_options):
+                    if mid.endswith(pref) or mid == pref:
+                        default_idx = i
+                        break
+                else:
+                    continue
+                break
+            emb_idx = st.selectbox(
+                "🎯 Модель эмбеддингов (фильтр релевантности)",
+                range(len(emb_options)),
+                index=default_idx,
+                format_func=lambda i: emb_labels[i],
+                help="Используется для оценки близости найденных статей к теме. "
+                     "Меньшие модели быстрее и дешевле, большие — точнее."
+            )
+            embedding_model_id = emb_options[emb_idx][0]
     else:
         st.caption("Введите API-ключ, чтобы загрузить список моделей.")
+        embedding_model_id = None
 
     st.divider()
     st.subheader("Источники для поиска")
@@ -858,6 +1047,12 @@ with st.sidebar:
         default=list(SOURCES.keys()),
     )
     per_source = st.slider("Источников на каждую базу", 2, 10, 4)
+    relevance_threshold = st.slider(
+        "🎯 Порог релевантности",
+        min_value=0.30, max_value=0.75, value=0.55, step=0.05,
+        help="Косинусная близость по эмбеддингам. "
+             "0.55 — разумно; ниже — пропускает мусор, выше — теряет пограничные работы."
+    )
     check_oa = st.checkbox(
         "Проверять открытый доступ (Unpaywall) для найденных DOI", value=True,
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
@@ -912,16 +1107,16 @@ with tab1:
         st.info("Выберите модель в боковой панели, чтобы начать.")
 
     if go:
-        # Шаг 0: извлекаем ключевые научные термины из темы до поиска
-        with st.spinner("🔍 Анализирую тему и формирую поисковые запросы…"):
-            queries = extract_search_queries(topic, api_key, provider, model_id)
+        # Шаг 0: переводим тему на русский и английский (сохраняя весь смысл)
+        with st.spinner("🌐 Перевожу тему на нужные языки для поиска…"):
+            queries = translate_topic(topic, api_key, provider, model_id)
 
-        with st.expander("🔎 Поисковые запросы к базам данных", expanded=False):
+        with st.expander("🌐 Тема на языках поисковых баз", expanded=False):
             st.markdown(
-                f"**Русский запрос:** `{queries['ru']}`  \n"
-                f"**Английский запрос:** `{queries['en']}`  \n"
-                "_Запросы автоматически извлечены из темы, чтобы избежать случайных "
-                "совпадений по вспомогательным словам (тренды, анализ, год и т.п.)_"
+                f"**Русский:** `{queries['ru']}`  \n"
+                f"**English:** `{queries['en']}`  \n"
+                "_Тема переведена целиком, все смысловые аспекты сохранены. "
+                "Англоязычным базам уходит английский вариант, остальным — русский._"
             )
 
         all_items = []
@@ -943,6 +1138,32 @@ with tab1:
                 all_items.extend(found)
         progress.progress(1.0, text="Поиск завершён")
 
+        # Шаг 1.5: Фильтрация по релевантности (embeddings)
+        # Работает с обоими провайдерами (Gemini native / Polza OpenAI-compat)
+        if embedding_model_id and len(all_items) > 3:
+            with st.spinner(f"🎯 Проверяю релевантность {len(all_items)} источников через {embedding_model_id}…"):
+                filtered, scored = filter_by_relevance(
+                    queries, all_items, provider, api_key, embedding_model_id,
+                    threshold=relevance_threshold,
+                )
+
+            if scored:
+                dropped = [(it, s) for it, s in scored if it not in filtered]
+                with st.expander(
+                    f"🎯 Фильтр релевантности: оставлено {len(filtered)} из {len(all_items)} "
+                    f"(порог: {relevance_threshold:.2f})", expanded=False
+                ):
+                    st.markdown("**Оставлены** (близость к теме):")
+                    kept_scores = {id(it): s for it, s in scored if it in filtered}
+                    for it in filtered:
+                        score = kept_scores.get(id(it), 0)
+                        st.markdown(f"- `{score:.3f}` · {it['title'][:100]}")
+                    if dropped:
+                        st.markdown("\n**Отброшены** (низкая релевантность):")
+                        for it, score in dropped:
+                            st.markdown(f"- `{score:.3f}` · {it['title'][:100]}")
+                all_items = filtered
+
         if check_oa:
             with st.spinner("Проверяю открытый доступ по DOI (Unpaywall)…"):
                 for it in all_items:
@@ -956,7 +1177,7 @@ with tab1:
             st.error("Ничего не найдено. Попробуйте переформулировать тему или выбрать другие источники.")
             st.stop()
 
-        with st.expander(f"📎 Найдено источников: {len(all_items)} (нажмите, чтобы посмотреть)"):
+        with st.expander(f"📎 Найдено релевантных источников: {len(all_items)} (нажмите, чтобы посмотреть)"):
             for i, it in enumerate(all_items, 1):
                 st.markdown(f"**[{i}] {it['title']}** ({it['year']}) — *{it['source']}*  \n{it['url']}")
 
