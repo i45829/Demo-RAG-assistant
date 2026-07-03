@@ -802,6 +802,24 @@ def call_openai_compat(system_prompt, user_message, base_url, model, temperature
                     "Попробуйте переформулировать тему или выбрать другую модель."
                 )
             return content
+        except httpx.ConnectError as exc:
+            # Сетевая ошибка уровня соединения (адрес недоступен, отказано в
+            # соединении и т.п.) — НЕ временный сбой удалённого сервера, повторные
+            # попытки с задержкой её не исправят. Сразу даём понятную причину.
+            is_local = "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url
+            if is_local:
+                raise ValueError(
+                    f"Не удалось подключиться к локальному серверу ({exc}). Вероятные причины:\n"
+                    f"1) Streamlit запущен не на том же компьютере, что и локальная модель "
+                    f"(например, в облаке Streamlit Cloud) — тогда 'localhost' указывает на "
+                    f"облачный контейнер, а не на ваш ПК. Нужен туннель (ngrok/devtunnel) "
+                    f"с публичным адресом вместо localhost.\n"
+                    f"2) Сервер (LM Studio/Ollama/vLLM) не запущен или слушает другой порт — "
+                    f"проверьте вкладку сервера в приложении.\n"
+                    f"3) Проблема IPv4/IPv6: попробуйте заменить 'localhost' на '127.0.0.1' "
+                    f"в Base URL."
+                ) from exc
+            raise ValueError(f"Не удалось подключиться к {url}: {exc}") from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last_exc = exc
             if attempt < 2:
@@ -1331,17 +1349,38 @@ with tab1:
             if not review or len(review.strip()) < 200:
                 final_len = len((review or "").strip())
                 reason = llm_problem or f"модель вернула только {final_len} символов"
-                st.error(
-                    f"❌ Модель не смогла сформировать обзор даже со второй попытки.\n\n"
-                    f"**Причина:** {reason}\n\n"
-                    f"Найдено источников: {len(all_items)}.\n\n"
-                    "**Что попробовать:**\n"
-                    "- Выбрать другую модель (например без 'thinking'/'reasoning' — "
-                    "gemini-2.0-flash или обычная gpt-4o без reasoning-суффикса)\n"
-                    "- Уменьшить «Источников на каждую базу» — меньше контекста для модели\n"
-                    "- Повысить температуру, если причина не в лимите токенов\n"
-                    "- Попробовать другого провайдера LLM"
+
+                is_connection_error = any(
+                    marker in reason.lower()
+                    for marker in ("подключиться", "connect", "address", "адрес",
+                                   "errno 99", "econnrefused", "econn")
                 )
+
+                if is_connection_error:
+                    st.error(
+                        f"❌ Не удалось подключиться к модели даже со второй попытки.\n\n"
+                        f"**Причина:** {reason}\n\n"
+                        "**Что попробовать:**\n"
+                        "- Если модель локальная (LM Studio/Ollama/vLLM) и Streamlit "
+                        "запущен в облаке — 'localhost' указывает на облачный контейнер, "
+                        "а не на ваш ПК. Нужен туннель (ngrok/devtunnel) с публичным "
+                        "адресом вместо localhost\n"
+                        "- Проверьте, что локальный сервер запущен и слушает указанный порт\n"
+                        "- Попробуйте заменить 'localhost' на '127.0.0.1' в Base URL\n"
+                        "- Попробуйте Polza.ai вместо локального провайдера"
+                    )
+                else:
+                    st.error(
+                        f"❌ Модель не смогла сформировать обзор даже со второй попытки.\n\n"
+                        f"**Причина:** {reason}\n\n"
+                        f"Найдено источников: {len(all_items)}.\n\n"
+                        "**Что попробовать:**\n"
+                        "- Выбрать другую модель (без 'thinking'/'reasoning' — например "
+                        "обычную gpt-4o без reasoning-суффикса)\n"
+                        "- Уменьшить «Источников на каждую базу» — меньше контекста для модели\n"
+                        "- Повысить температуру, если причина не в лимите токенов\n"
+                        "- Попробовать другого провайдера LLM"
+                    )
                 st.stop()
 
         st.success("Обзор готов!")
