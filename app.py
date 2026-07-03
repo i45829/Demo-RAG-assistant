@@ -1046,12 +1046,10 @@ with st.sidebar:
         "Выберите базы", all_source_names,
         default=list(SOURCES.keys()),
     )
-    per_source = st.slider("Источников на каждую базу", 2, 10, 4)
-    relevance_threshold = st.slider(
-        "🎯 Порог релевантности",
-        min_value=0.30, max_value=0.75, value=0.55, step=0.05,
-        help="Косинусная близость по эмбеддингам. "
-             "0.55 — разумно; ниже — пропускает мусор, выше — теряет пограничные работы."
+    per_source = st.slider(
+        "Релевантных источников на каждую базу", 2, 10, 4,
+        help="Целевое число статей от каждой базы ПОСЛЕ фильтрации по релевантности. "
+             "Приложение тянет из API в 3× больше и оставляет топ-N по эмбеддингам."
     )
     check_oa = st.checkbox(
         "Проверять открытый доступ (Unpaywall) для найденных DOI", value=True,
@@ -1120,49 +1118,74 @@ with tab1:
             )
 
         all_items = []
+        # Список кортежей (item, score, source_name) для итогового отчёта
+        all_scored_report = []
+        # Множитель добора: тянем в 3 раза больше, потом фильтруем
+        OVERFETCH_MULTIPLIER = 3
+        MAX_FETCH_PER_SOURCE = 30  # верхний предел — не бомбить API
+
         progress = st.progress(0.0, text="Поиск источников…")
         for i, name in enumerate(selected_sources):
             progress.progress((i) / len(selected_sources), text=f"Ищу в {name}…")
-            # Англоязычным базам — английский запрос, остальным — русский
             api_query = queries["en"] if name in ENGLISH_CENTRIC else queries["ru"]
+
+            # Тянем с запасом: per_source * 3, но не больше MAX_FETCH_PER_SOURCE
+            fetch_count = min(per_source * OVERFETCH_MULTIPLIER, MAX_FETCH_PER_SOURCE)
+
             if name in SOURCES:
-                found = SOURCES[name](api_query, per_source)
-                all_items.extend(found)
+                found = SOURCES[name](api_query, fetch_count)
             elif name in PATENT_SOURCES:
                 fn, cred_fields = PATENT_SOURCES[name]
                 creds = patent_credentials.get(name, {})
                 args = [creds.get(session_key, "") for _, session_key in cred_fields]
-                found, err = fn(api_query, per_source, *args)
+                found, err = fn(api_query, fetch_count, *args)
                 if err:
                     st.warning(err)
-                all_items.extend(found)
+            else:
+                found = []
+
+            # Фильтруем эту базу отдельно, добирая до per_source
+            if found and embedding_model_id and len(found) > per_source:
+                try:
+                    _, scored_here = filter_by_relevance(
+                        queries, found, provider, api_key, embedding_model_id,
+                        threshold=0.0,  # порог отключён — берём топ-N по score
+                    )
+                    # scored_here уже отсортирован по убыванию score
+                    top_items = [it for it, _ in scored_here[:per_source]]
+                    all_items.extend(top_items)
+                    # Сохраняем для отчёта (только оставленные)
+                    for it, score in scored_here[:per_source]:
+                        all_scored_report.append((it, score, name, True))
+                    for it, score in scored_here[per_source:]:
+                        all_scored_report.append((it, score, name, False))
+                except Exception as exc:
+                    st.warning(f"{name}: фильтр эмбеддингов не сработал ({exc}), "
+                               f"беру первые {per_source} по порядку API")
+                    all_items.extend(found[:per_source])
+            else:
+                # Либо мало источников, либо нет embedding-модели — берём как есть
+                all_items.extend(found[:per_source])
+
         progress.progress(1.0, text="Поиск завершён")
 
-        # Шаг 1.5: Фильтрация по релевантности (embeddings)
-        # Работает с обоими провайдерами (Gemini native / Polza OpenAI-compat)
-        if embedding_model_id and len(all_items) > 3:
-            with st.spinner(f"🎯 Проверяю релевантность {len(all_items)} источников через {embedding_model_id}…"):
-                filtered, scored = filter_by_relevance(
-                    queries, all_items, provider, api_key, embedding_model_id,
-                    threshold=relevance_threshold,
-                )
-
-            if scored:
-                dropped = [(it, s) for it, s in scored if it not in filtered]
-                with st.expander(
-                    f"🎯 Фильтр релевантности: оставлено {len(filtered)} из {len(all_items)} "
-                    f"(порог: {relevance_threshold:.2f})", expanded=False
-                ):
-                    st.markdown("**Оставлены** (близость к теме):")
-                    kept_scores = {id(it): s for it, s in scored if it in filtered}
-                    for it in filtered:
-                        score = kept_scores.get(id(it), 0)
-                        st.markdown(f"- `{score:.3f}` · {it['title'][:100]}")
-                    if dropped:
-                        st.markdown("\n**Отброшены** (низкая релевантность):")
-                        for it, score in dropped:
-                            st.markdown(f"- `{score:.3f}` · {it['title'][:100]}")
-                all_items = filtered
+        # Отчёт: показываем что взяли и что отбросили
+        if all_scored_report:
+            kept_count = sum(1 for *_, kept in all_scored_report if kept)
+            dropped_count = len(all_scored_report) - kept_count
+            with st.expander(
+                f"🎯 Фильтр релевантности: оставлено {kept_count}, "
+                f"отброшено {dropped_count} (по эмбеддингам)", expanded=False
+            ):
+                # Группируем по базе
+                by_source = {}
+                for it, score, source_name, kept in all_scored_report:
+                    by_source.setdefault(source_name, []).append((it, score, kept))
+                for source_name, entries in by_source.items():
+                    st.markdown(f"**{source_name}**")
+                    for it, score, kept in entries:
+                        mark = "✅" if kept else "❌"
+                        st.markdown(f"- {mark} `{score:.3f}` · {it['title'][:100]}")
 
         if check_oa:
             with st.spinner("Проверяю открытый доступ по DOI (Unpaywall)…"):
