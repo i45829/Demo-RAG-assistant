@@ -3,14 +3,17 @@ app.py — Демо-система «Литературный обзор по т
 
 ЧТО ДЕЛАЕТ:
   1. Пользователь вводит тему в браузере (никакой установки — просто веб-страница).
-  2. Приложение ищет источники через бесплатные научные API (OpenAlex, arXiv,
-     Europe PMC, DOAJ, Crossref + Unpaywall для платных статей).
-  3. Собранные данные передаются в LLM (Claude или Gemini — на выбор), которая
+  2. Приложение ищет источники через открытые научные API: PubMed / NCBI,
+     Europe PMC, OpenAlex, OpenAIRE, Crossref, DOAJ, arXiv; дополнительно может
+     проверить открытые копии статей через Unpaywall и патенты РФ через Роспатент.
+  3. Найденные источники нормализуются, дедублицируются и ранжируются по
+     близости к теме через embeddings.
+  4. Собранные данные передаются в LLM (Google Gemini или Polza.ai), которая
      синтезирует обзор литературы с нумерованными ссылками [n].
-  4. Результат показывается в браузере и скачивается как .docx.
+  5. Результат показывается в браузере и скачивается как .docx.
 
 ЗАПУСК ЛОКАЛЬНО (для проверки перед деплоем, не обязателен для демо):
-  pip install streamlit httpx python-docx
+  pip install streamlit httpx python-docx feedparser
   streamlit run app.py
 
 ДЕПЛОЙ (бесплатно, без установки на ПК начальства) — см. файл
@@ -20,8 +23,6 @@ deploy_streamlit_cloud.md в комплекте.
 import io
 import os
 import time
-import base64
-import json
 from datetime import date
 
 import httpx
@@ -223,7 +224,7 @@ def search_doaj(query, max_results=5):
         from urllib.parse import quote
         r = _get(
             f"https://doaj.org/api/search/articles/{quote(query)}",
-            params={"page_size": max_results}, timeout=20,
+            params={"pageSize": max_results}, timeout=20,
         )
         r.raise_for_status()
         items = []
@@ -287,6 +288,56 @@ def search_semanticscholar(query, max_results=5):
                    + ("" if ss_key else " — попробуйте добавить бесплатный ключ S2 в настройки источников"))
         return []
 
+
+
+def search_openalex(query, max_results=5):
+    """OpenAlex — крупная открытая база научных работ и метаданных.
+    Хорошо дополняет Crossref/OpenAIRE: часто возвращает DOI, авторов, год,
+    landing page и abstract inverted index."""
+    try:
+        r = _get(
+            "https://api.openalex.org/works",
+            params={
+                "search": query,
+                "per-page": max_results,
+                "mailto": CONTACT_EMAIL,
+                "sort": "relevance_score:desc",
+            },
+            timeout=25,
+        )
+        r.raise_for_status()
+        items = []
+        for w in (r.json().get("results") or [])[:max_results]:
+            doi_url = w.get("doi") or ""
+            doi = doi_url.removeprefix("https://doi.org/") if doi_url else ""
+            authorships = w.get("authorships") or []
+            authors = ", ".join(
+                ((a.get("author") or {}).get("display_name") or "")
+                for a in authorships[:5]
+            ).strip(", ") or "н/д"
+            abstract = ""
+            inv = w.get("abstract_inverted_index") or {}
+            if inv:
+                words = []
+                for word, positions in inv.items():
+                    for pos in positions:
+                        words.append((pos, word))
+                abstract = " ".join(word for _, word in sorted(words))
+            primary = w.get("primary_location") or {}
+            best_url = doi_url or (primary.get("landing_page_url") or w.get("id") or "")
+            items.append({
+                "title": w.get("title") or "(без названия)",
+                "authors": authors,
+                "year": w.get("publication_year") or "н/д",
+                "source": "OpenAlex",
+                "url": best_url,
+                "doi": doi,
+                "abstract": _trim(abstract),
+            })
+        return items
+    except Exception as exc:
+        st.warning(f"OpenAlex: не удалось получить данные ({exc})")
+        return []
 
 def search_openaire(query, max_results=5):
     """OpenAIRE Graph API — актуальный стабильный endpoint researchProducts.
@@ -383,6 +434,38 @@ def check_unpaywall(doi):
         return best.get("url_for_pdf") or best.get("url")
     except Exception:
         return None
+
+
+
+def _dedupe_key(item: dict) -> tuple:
+    """Ключ дедупликации: сначала DOI, затем нормализованный заголовок."""
+    import re as _re
+    doi = (item.get("doi") or "").strip().lower()
+    if doi:
+        return ("doi", doi)
+    title = (item.get("title") or "").lower()
+    title = _re.sub(r"\s+", " ", title)
+    title = _re.sub(r"[^\w\sа-яё-]", "", title, flags=_re.IGNORECASE).strip()
+    return ("title", title)
+
+
+def deduplicate_items(items: list) -> tuple:
+    """Удаляет повторы между базами. Возвращает (unique_items, duplicates_count)."""
+    seen = set()
+    unique = []
+    duplicates = 0
+    for item in items:
+        key = _dedupe_key(item)
+        # Пустые/слишком короткие заголовки не считаем надёжным ключом.
+        if key[0] == "title" and len(key[1]) < 12:
+            unique.append(item)
+            continue
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique, duplicates
 
 
 # ============================== ПАТЕНТНЫЕ БАЗЫ (нужны свои ключи) ==============================
@@ -490,16 +573,10 @@ PATENT_SOURCES = {
 }
 
 
-
-# PatentsView возвращает (items, None) / ([], msg) — адаптируем в обёртку
-def _patentsview_wrap(query, max_results=5):
-    """Обёртка, чтобы PatentsView вписывался в обычный SOURCES (возвращает list)."""
-    result = search_patentsview_legacy(query, max_results)
-    return result  # search_patentsview_legacy уже возвращает list и сам вызывает st.warning
-
 SOURCES = {
     "PubMed / NCBI (медицина, химия, биология)": search_pubmed,
     "Europe PMC (PMC + Европейская коллекция)": search_europepmc,
+    "OpenAlex (открытый индекс научных работ)": search_openalex,
     "OpenAIRE (85M+ открытых публикаций, без ключа)": search_openaire,
     "Crossref (метаданные DOI + Unpaywall)": search_crossref,
     "DOAJ (открытые журналы)": search_doaj,
@@ -510,6 +587,7 @@ SOURCES = {
 # Источники, для которых нужен английский запрос (они плохо ищут по русским словам)
 ENGLISH_CENTRIC = {
     "PubMed / NCBI (медицина, химия, биология)",
+    "OpenAlex (открытый индекс научных работ)",
     "OpenAIRE (85M+ открытых публикаций, без ключа)",
     "arXiv (препринты, тема на англ.)",
     "DOAJ (открытые журналы)",
@@ -716,6 +794,17 @@ REVIEW_SYSTEM_PROMPT = """Ты — научный аналитик, готовя
 # мало источников → длинные аннотации; много → обрезаем, чтобы не перегрузить контекст.
 _MAX_TOTAL_CONTEXT = 60_000   # ~15K токенов — комфортно для всех моделей
 _MIN_ABSTRACT_PER_ITEM = 300  # минимум даже при большом количестве источников
+
+
+
+
+def validate_review_citations(review_markdown: str, source_count: int) -> tuple:
+    """Проверяет, что LLM не сослалась на несуществующие номера источников.
+    Возвращает (ok, invalid_numbers)."""
+    import re as _re
+    nums = [int(n) for n in _re.findall(r"\[(\d+)\]", review_markdown or "")]
+    invalid = sorted({n for n in nums if n < 1 or n > source_count})
+    return not invalid, invalid
 
 
 def build_user_message(topic, items):
@@ -1144,21 +1233,19 @@ with tab1:
             else:
                 found = []
 
-            # Фильтруем эту базу отдельно, добирая до per_source
+            # Фильтруем эту базу отдельно: сначала отсев по порогу, затем top-N.
+            # Если embeddings недоступны или результатов мало — берём первые N по порядку API.
             if found and embedding_model_id and len(found) > per_source:
                 try:
-                    _, scored_here = filter_by_relevance(
+                    filtered_here, scored_here = filter_by_relevance(
                         queries, found, provider, api_key, embedding_model_id,
-                        threshold=0.0,  # порог отключён — берём топ-N по score
+                        threshold=0.55,
                     )
-                    # scored_here уже отсортирован по убыванию score
-                    top_items = [it for it, _ in scored_here[:per_source]]
+                    top_items = filtered_here[:per_source]
+                    kept_ids = {id(it) for it in top_items}
                     all_items.extend(top_items)
-                    # Сохраняем для отчёта (только оставленные)
-                    for it, score in scored_here[:per_source]:
-                        all_scored_report.append((it, score, name, True))
-                    for it, score in scored_here[per_source:]:
-                        all_scored_report.append((it, score, name, False))
+                    for it, score in scored_here:
+                        all_scored_report.append((it, score, name, id(it) in kept_ids))
                 except Exception as exc:
                     st.warning(f"{name}: фильтр эмбеддингов не сработал ({exc}), "
                                f"беру первые {per_source} по порядку API")
@@ -1168,6 +1255,10 @@ with tab1:
                 all_items.extend(found[:per_source])
 
         progress.progress(1.0, text="Поиск завершён")
+
+        all_items, duplicate_count = deduplicate_items(all_items)
+        if duplicate_count:
+            st.caption(f"🔁 Удалены дубли источников между базами: {duplicate_count}.")
 
         # Отчёт: показываем что взяли и что отбросили
         if all_scored_report:
@@ -1268,6 +1359,14 @@ with tab1:
         st.success("Обзор готов!")
         st.markdown(review)
 
+        citations_ok, invalid_citations = validate_review_citations(review, len(all_items))
+        if not citations_ok:
+            st.warning(
+                "⚠️ В тексте обнаружены ссылки на несуществующие источники: "
+                + ", ".join(f"[{n}]" for n in invalid_citations)
+                + ". Проверьте обзор перед использованием."
+            )
+
         docx_buf = build_docx(topic, review)
         st.download_button(
             "⬇️ Скачать как Word (.docx)",
@@ -1278,7 +1377,7 @@ with tab1:
 
     st.divider()
     st.caption(
-        "Демо-версия. Источники: PubMed / NCBI, Europe PMC, OpenAIRE, Crossref, DOAJ, arXiv, Роспатент. "
+        "Демо-версия. Источники: PubMed / NCBI, Europe PMC, OpenAlex, OpenAIRE, Crossref, DOAJ, arXiv, Роспатент. "
         "Полный список используемых баз и логика проверки цитирования — в промт-шаблоне проекта."
     )
 
