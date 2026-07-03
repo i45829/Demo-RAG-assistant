@@ -3,17 +3,14 @@ app.py — Демо-система «Литературный обзор по т
 
 ЧТО ДЕЛАЕТ:
   1. Пользователь вводит тему в браузере (никакой установки — просто веб-страница).
-  2. Приложение ищет источники через открытые научные API: PubMed / NCBI,
-     Europe PMC, OpenAlex, OpenAIRE, Crossref, DOAJ, arXiv; дополнительно может
-     проверить открытые копии статей через Unpaywall и патенты РФ через Роспатент.
-  3. Найденные источники нормализуются, дедублицируются и ранжируются по
-     близости к теме через embeddings.
-  4. Собранные данные передаются в LLM (Google Gemini или Polza.ai), которая
+  2. Приложение ищет источники через бесплатные научные API (OpenAlex, arXiv,
+     Europe PMC, DOAJ, Crossref + Unpaywall для платных статей).
+  3. Собранные данные передаются в LLM (Claude или Gemini — на выбор), которая
      синтезирует обзор литературы с нумерованными ссылками [n].
-  5. Результат показывается в браузере и скачивается как .docx.
+  4. Результат показывается в браузере и скачивается как .docx.
 
 ЗАПУСК ЛОКАЛЬНО (для проверки перед деплоем, не обязателен для демо):
-  pip install streamlit httpx python-docx feedparser
+  pip install streamlit httpx python-docx
   streamlit run app.py
 
 ДЕПЛОЙ (бесплатно, без установки на ПК начальства) — см. файл
@@ -23,6 +20,8 @@ deploy_streamlit_cloud.md в комплекте.
 import io
 import os
 import time
+import base64
+import json
 from datetime import date
 
 import httpx
@@ -289,56 +288,6 @@ def search_semanticscholar(query, max_results=5):
         return []
 
 
-
-def search_openalex(query, max_results=5):
-    """OpenAlex — крупная открытая база научных работ и метаданных.
-    Хорошо дополняет Crossref/OpenAIRE: часто возвращает DOI, авторов, год,
-    landing page и abstract inverted index."""
-    try:
-        r = _get(
-            "https://api.openalex.org/works",
-            params={
-                "search": query,
-                "per-page": max_results,
-                "mailto": CONTACT_EMAIL,
-                "sort": "relevance_score:desc",
-            },
-            timeout=25,
-        )
-        r.raise_for_status()
-        items = []
-        for w in (r.json().get("results") or [])[:max_results]:
-            doi_url = w.get("doi") or ""
-            doi = doi_url.removeprefix("https://doi.org/") if doi_url else ""
-            authorships = w.get("authorships") or []
-            authors = ", ".join(
-                ((a.get("author") or {}).get("display_name") or "")
-                for a in authorships[:5]
-            ).strip(", ") or "н/д"
-            abstract = ""
-            inv = w.get("abstract_inverted_index") or {}
-            if inv:
-                words = []
-                for word, positions in inv.items():
-                    for pos in positions:
-                        words.append((pos, word))
-                abstract = " ".join(word for _, word in sorted(words))
-            primary = w.get("primary_location") or {}
-            best_url = doi_url or (primary.get("landing_page_url") or w.get("id") or "")
-            items.append({
-                "title": w.get("title") or "(без названия)",
-                "authors": authors,
-                "year": w.get("publication_year") or "н/д",
-                "source": "OpenAlex",
-                "url": best_url,
-                "doi": doi,
-                "abstract": _trim(abstract),
-            })
-        return items
-    except Exception as exc:
-        st.warning(f"OpenAlex: не удалось получить данные ({exc})")
-        return []
-
 def search_openaire(query, max_results=5):
     """OpenAIRE Graph API — актуальный стабильный endpoint researchProducts.
     Старый /search/publications часто отдаёт 400 из-за смены схемы параметров."""
@@ -434,38 +383,6 @@ def check_unpaywall(doi):
         return best.get("url_for_pdf") or best.get("url")
     except Exception:
         return None
-
-
-
-def _dedupe_key(item: dict) -> tuple:
-    """Ключ дедупликации: сначала DOI, затем нормализованный заголовок."""
-    import re as _re
-    doi = (item.get("doi") or "").strip().lower()
-    if doi:
-        return ("doi", doi)
-    title = (item.get("title") or "").lower()
-    title = _re.sub(r"\s+", " ", title)
-    title = _re.sub(r"[^\w\sа-яё-]", "", title, flags=_re.IGNORECASE).strip()
-    return ("title", title)
-
-
-def deduplicate_items(items: list) -> tuple:
-    """Удаляет повторы между базами. Возвращает (unique_items, duplicates_count)."""
-    seen = set()
-    unique = []
-    duplicates = 0
-    for item in items:
-        key = _dedupe_key(item)
-        # Пустые/слишком короткие заголовки не считаем надёжным ключом.
-        if key[0] == "title" and len(key[1]) < 12:
-            unique.append(item)
-            continue
-        if key in seen:
-            duplicates += 1
-            continue
-        seen.add(key)
-        unique.append(item)
-    return unique, duplicates
 
 
 # ============================== ПАТЕНТНЫЕ БАЗЫ (нужны свои ключи) ==============================
@@ -573,10 +490,16 @@ PATENT_SOURCES = {
 }
 
 
+
+# PatentsView возвращает (items, None) / ([], msg) — адаптируем в обёртку
+def _patentsview_wrap(query, max_results=5):
+    """Обёртка, чтобы PatentsView вписывался в обычный SOURCES (возвращает list)."""
+    result = search_patentsview_legacy(query, max_results)
+    return result  # search_patentsview_legacy уже возвращает list и сам вызывает st.warning
+
 SOURCES = {
     "PubMed / NCBI (медицина, химия, биология)": search_pubmed,
     "Europe PMC (PMC + Европейская коллекция)": search_europepmc,
-    "OpenAlex (открытый индекс научных работ)": search_openalex,
     "OpenAIRE (85M+ открытых публикаций, без ключа)": search_openaire,
     "Crossref (метаданные DOI + Unpaywall)": search_crossref,
     "DOAJ (открытые журналы)": search_doaj,
@@ -587,7 +510,6 @@ SOURCES = {
 # Источники, для которых нужен английский запрос (они плохо ищут по русским словам)
 ENGLISH_CENTRIC = {
     "PubMed / NCBI (медицина, химия, биология)",
-    "OpenAlex (открытый индекс научных работ)",
     "OpenAIRE (85M+ открытых публикаций, без ключа)",
     "arXiv (препринты, тема на англ.)",
     "DOAJ (открытые журналы)",
@@ -688,14 +610,14 @@ def _cosine_similarity(v1: list, v2: list) -> float:
 
 def filter_by_relevance(topic_translated: dict, items: list, provider: str,
                         api_key: str, embedding_model: str,
-                        threshold: float = 0.55) -> tuple:
-    """Оставляет только статьи, косинусно близкие к теме (по эмбеддингам).
-    Возвращает (отфильтрованный список, оценки для отчёта).
+                        threshold=None) -> tuple:
+    """Сортирует статьи по косинусной близости к теме (по эмбеддингам).
+    Возвращает (filtered_items, scored_items).
 
-    threshold=0.55 подобран как разумный компромисс:
-    - <0.45: мусор проходит
-    - 0.55: отсекает явно нерелевантное, сохраняя пограничные случаи
-    - >0.65: слишком строго, теряются близкие по духу работы"""
+    В основном сценарии threshold=None: это ранжирование, а не жёсткий отсев.
+    Поэтому настройка «источников на каждую базу» работает ожидаемо: берём top-N
+    из найденных кандидатов. Если threshold задан числом, дополнительно отбрасываем
+    статьи ниже порога."""
     if not items:
         return items, []
 
@@ -738,10 +660,14 @@ def filter_by_relevance(topic_translated: dict, items: list, provider: str,
     # Сортируем по убыванию релевантности
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # Оставляем прошедшие порог, но не меньше 3 (даже если все близки к границе)
-    filtered = [it for it, score in scored if score >= threshold]
-    if len(filtered) < 3 and len(scored) >= 3:
-        filtered = [it for it, _ in scored[:3]]
+    if threshold is None:
+        filtered = [it for it, _ in scored]
+    else:
+        # Строгий режим: оставляем прошедшие порог, но не меньше 3,
+        # чтобы при узких темах обзор не становился пустым.
+        filtered = [it for it, score in scored if score >= threshold]
+        if len(filtered) < 3 and len(scored) >= 3:
+            filtered = [it for it, _ in scored[:3]]
 
     return filtered, scored
 
@@ -792,19 +718,8 @@ REVIEW_SYSTEM_PROMPT = """Ты — научный аналитик, готовя
 
 # Максимум символов на один источник зависит от числа источников:
 # мало источников → длинные аннотации; много → обрезаем, чтобы не перегрузить контекст.
-_MAX_TOTAL_CONTEXT = 60_000   # ~15K токенов — комфортно для всех моделей
+_MAX_TOTAL_CONTEXT = 40_000   # ограничиваем контекст, чтобы модели стабильнее возвращали полный обзор
 _MIN_ABSTRACT_PER_ITEM = 300  # минимум даже при большом количестве источников
-
-
-
-
-def validate_review_citations(review_markdown: str, source_count: int) -> tuple:
-    """Проверяет, что LLM не сослалась на несуществующие номера источников.
-    Возвращает (ok, invalid_numbers)."""
-    import re as _re
-    nums = [int(n) for n in _re.findall(r"\[(\d+)\]", review_markdown or "")]
-    invalid = sorted({n for n in nums if n < 1 or n > source_count})
-    return not invalid, invalid
 
 
 def build_user_message(topic, items):
@@ -818,8 +733,9 @@ def build_user_message(topic, items):
     lines = [
         f"ТЕМА ОБЗОРА: {topic}", "",
         f"ИСТОЧНИКОВ ПЕРЕДАНО: {len(items)}, из них с аннотацией: {n_with_abstract}.",
-        "Если аннотация пуста ('н/д') — используй название/авторов/год,",
-        "пометив '(аннотация недоступна)'. НЕ оставляй обзор пустым.", "",
+        "Напиши обзор в Markdown на русском языке.",
+        "Если аннотация пуста ('н/д') — используй только название/авторов/год и явно пометь '(аннотация недоступна)'.",
+        "Не оставляй обзор пустым. Не добавляй источники, которых нет в списке.", "",
     ]
     for i, it in enumerate(items, 1):
         abst = (it.get("abstract") or "н/д").strip()
@@ -833,12 +749,82 @@ def build_user_message(topic, items):
     return "\n".join(lines)
 
 
+
+
+def build_source_based_review(topic: str, items: list, reason: str = "") -> str:
+    """Детерминированный резервный обзор без LLM.
+    Нужен, чтобы приложение не падало, если модель вернула пустой/слишком короткий ответ."""
+    def _short(text, limit=500):
+        text = (text or "").strip().replace("\n", " ")
+        return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+    with_abstract = [(i, it) for i, it in enumerate(items, 1) if (it.get("abstract") or "").strip()]
+    without_abstract = [(i, it) for i, it in enumerate(items, 1) if not (it.get("abstract") or "").strip()]
+
+    lines = [
+        "## Введение",
+        f"Тема обзора: {topic}. Ниже приведён резервный черновик, сформированный автоматически по найденным источникам, потому что LLM не вернула полноценный текст.",
+        f"В подборке {len(items)} источников; аннотации доступны у {len(with_abstract)} источников. Содержательные выводы ниже опираются преимущественно на источники с аннотациями.",
+        "",
+        "## Обзор литературы",
+    ]
+
+    if reason:
+        lines.extend([
+            "### Техническое ограничение генерации",
+            f"Основная генерация не дала полного результата: {reason}. Поэтому этот раздел является техническим черновиком, а не финальным научным текстом.",
+            "",
+        ])
+
+    if with_abstract:
+        lines.append("### Источники с аннотациями")
+        for n, it in with_abstract:
+            title = it.get("title", "(без названия)")
+            year = it.get("year", "н/д")
+            source = it.get("source", "н/д")
+            abstract = _short(it.get("abstract", ""), 650)
+            lines.append(f"Источник [{n}] — «{title}» ({year}, {source}) — содержит следующие сведения: {abstract} [{n}]")
+        lines.append("")
+
+    if without_abstract:
+        lines.append("### Источники без аннотаций")
+        for n, it in without_abstract:
+            title = it.get("title", "(без названия)")
+            year = it.get("year", "н/д")
+            source = it.get("source", "н/д")
+            lines.append(f"Источник [{n}] — «{title}» ({year}, {source}) включён в подборку, но аннотация недоступна; по нему нельзя делать подробные содержательные выводы без просмотра полного текста или карточки публикации [{n}].")
+        lines.append("")
+
+    cited = ", ".join(f"[{n}]" for n, _ in with_abstract[:12]) or "источники с аннотациями отсутствуют"
+    lines.extend([
+        "## Выводы и направления дальнейших исследований",
+        f"- Для полноценного обзора нужно вручную проверить источники с наиболее информативными аннотациями: {cited}.",
+        "- Источники без аннотаций следует использовать осторожно: они пригодны для расширения библиографии, но не для сильных содержательных выводов без полного текста.",
+        "- Рекомендация: повторить генерацию с меньшим числом источников или с другой моделью, если нужен связный аналитический текст вместо технического черновика.",
+        "",
+        "## Список литературы",
+    ])
+
+    for i, it in enumerate(items, 1):
+        authors = it.get("authors") or "н/д"
+        title = it.get("title") or "(без названия)"
+        year = it.get("year") or "н/д"
+        source = it.get("source") or "н/д"
+        url = it.get("url") or "н/д"
+        lines.append(f"[{i}] {authors}. {title}. {year}. {source}. {url}")
+
+    return "\n".join(lines)
+
+
 def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash", temperature=0.3):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_message}]}],
-        "generationConfig": {"temperature": temperature},
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": 8192,
+        },
     }
     last_exc = None
     for attempt in range(3):
@@ -885,7 +871,9 @@ def call_gemini(system_prompt, user_message, api_key, model="gemini-2.0-flash", 
 def call_polza(system_prompt, user_message, api_key, model, temperature=0.3):
     """Polza.ai — агрегатор моделей с OpenAI-совместимым API."""
     body = {
-        "model": model, "temperature": temperature,
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": 4096,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -1131,19 +1119,58 @@ with st.sidebar:
         CONTACT_EMAIL = contact_email_input.strip()
 
     all_source_names = list(SOURCES.keys()) + list(PATENT_SOURCES.keys())
+    default_source_names = list(SOURCES.keys()) + list(PATENT_SOURCES.keys())
+    default_sources_version = "sources-defaults-v2-rospatent"
+
+    # Streamlit хранит значение multiselect в session_state. Если пользователь уже
+    # запускал старую версию приложения, новый default сам по себе не применится.
+    # Поэтому один раз мигрируем старое состояние: добавляем Роспатент к текущему
+    # выбору, но не навязываем его на каждом rerun — после миграции его можно снять вручную.
+    if st.session_state.get("selected_sources_defaults_version") != default_sources_version:
+        current_sources = st.session_state.get("selected_sources_widget")
+        if current_sources:
+            migrated_sources = list(dict.fromkeys(list(current_sources) + list(PATENT_SOURCES.keys())))
+        else:
+            migrated_sources = default_source_names
+        st.session_state["selected_sources_widget"] = [
+            name for name in migrated_sources if name in all_source_names
+        ]
+        st.session_state["selected_sources_defaults_version"] = default_sources_version
+
     selected_sources = st.multiselect(
-        "Выберите базы", all_source_names,
-        default=list(SOURCES.keys()),
+        "Выберите базы",
+        all_source_names,
+        key="selected_sources_widget",
     )
     per_source = st.slider(
-        "Релевантных источников на каждую базу", 2, 10, 4,
-        help="Целевое число статей от каждой базы ПОСЛЕ фильтрации по релевантности. "
-             "Приложение тянет из API в 3× больше и оставляет топ-N по эмбеддингам."
+        "Источников на каждую базу", 2, 10, 4,
+        help="Сколько лучших результатов брать из каждой выбранной базы. "
+             "Приложение тянет из API в 3× больше, ранжирует кандидатов по эмбеддингам "
+             "и оставляет top-N. Это не жёсткий пороговый отсев."
     )
     check_oa = st.checkbox(
         "Проверять открытый доступ (Unpaywall) для найденных DOI", value=True,
         help="Ищет легальную бесплатную копию, если статья из платного журнала."
     )
+
+    st.divider()
+    if st.button(
+        "🧹 Очистить кеш и сбросить состояние",
+        help="Сбрасывает @st.cache_data/@st.cache_resource и очищает состояние формы. "
+             "После перезапуска можно повторить запрос с базами по умолчанию, включая Роспатент."
+    ):
+        st.cache_data.clear()
+        try:
+            st.cache_resource.clear()
+        except Exception:
+            pass
+        for key in list(st.session_state.keys()):
+            if key.startswith("selected_sources") or key.startswith("cache_cleared"):
+                del st.session_state[key]
+        st.session_state["cache_cleared_notice"] = True
+        st.rerun()
+    if st.session_state.pop("cache_cleared_notice", False):
+        st.success("Кеш и состояние формы очищены. Можно повторить запрос.")
 
     # Поля для ключей выбранных патентных источников
     selected_patent_sources = [s for s in selected_sources if s in PATENT_SOURCES]
@@ -1233,21 +1260,23 @@ with tab1:
             else:
                 found = []
 
-            # Фильтруем эту базу отдельно: сначала отсев по порогу, затем top-N.
-            # Если embeddings недоступны или результатов мало — берём первые N по порядку API.
+            # Фильтруем эту базу отдельно, добирая до per_source
             if found and embedding_model_id and len(found) > per_source:
                 try:
-                    filtered_here, scored_here = filter_by_relevance(
+                    _, scored_here = filter_by_relevance(
                         queries, found, provider, api_key, embedding_model_id,
-                        threshold=0.55,
+                        threshold=None,  # порог отключён — берём top-N по score
                     )
-                    top_items = filtered_here[:per_source]
-                    kept_ids = {id(it) for it in top_items}
+                    # scored_here уже отсортирован по убыванию score
+                    top_items = [it for it, _ in scored_here[:per_source]]
                     all_items.extend(top_items)
-                    for it, score in scored_here:
-                        all_scored_report.append((it, score, name, id(it) in kept_ids))
+                    # Сохраняем для отчёта (только оставленные)
+                    for it, score in scored_here[:per_source]:
+                        all_scored_report.append((it, score, name, True))
+                    for it, score in scored_here[per_source:]:
+                        all_scored_report.append((it, score, name, False))
                 except Exception as exc:
-                    st.warning(f"{name}: фильтр эмбеддингов не сработал ({exc}), "
+                    st.warning(f"{name}: ранжирование по эмбеддингам не сработало ({exc}), "
                                f"беру первые {per_source} по порядку API")
                     all_items.extend(found[:per_source])
             else:
@@ -1256,17 +1285,13 @@ with tab1:
 
         progress.progress(1.0, text="Поиск завершён")
 
-        all_items, duplicate_count = deduplicate_items(all_items)
-        if duplicate_count:
-            st.caption(f"🔁 Удалены дубли источников между базами: {duplicate_count}.")
-
         # Отчёт: показываем что взяли и что отбросили
         if all_scored_report:
             kept_count = sum(1 for *_, kept in all_scored_report if kept)
             dropped_count = len(all_scored_report) - kept_count
             with st.expander(
-                f"🎯 Фильтр релевантности: оставлено {kept_count}, "
-                f"отброшено {dropped_count} (по эмбеддингам)", expanded=False
+                f"🎯 Ранжирование релевантности: выбрано {kept_count}, "
+                f"не выбрано {dropped_count} (по эмбеддингам)", expanded=False
             ):
                 # Группируем по базе
                 by_source = {}
@@ -1295,77 +1320,58 @@ with tab1:
             for i, it in enumerate(all_items, 1):
                 st.markdown(f"**[{i}] {it['title']}** ({it['year']}) — *{it['source']}*  \n{it['url']}")
 
-        with st.spinner("ИИ формирует обзор литературы… (может занять до 1 мин)"):
+        llm_problem = ""
+        with st.spinner("ИИ формирует обзор литературы…"):
             user_msg = build_user_message(topic, all_items)
             try:
                 active_prompt = st.session_state.get("system_prompt", REVIEW_SYSTEM_PROMPT)
                 review = call_llm(provider, model_id, active_prompt, user_msg, api_key, temperature=temperature)
             except Exception as exc:
-                err_str = str(exc)
-                if "503" in err_str:
-                    st.error(
-                        f"❌ Сервер модели временно недоступен (503) — попробуйте нажать "
-                        f"«Сформировать обзор» ещё раз через 10–20 секунд. "
-                        f"Это временный сбой на стороне провайдера, не проблема приложения."
-                    )
-                elif "429" in err_str:
-                    st.error(
-                        f"❌ Превышен лимит запросов к модели (429). "
-                        f"Подождите 30–60 секунд и повторите."
-                    )
-                else:
-                    st.error(f"❌ Ошибка обращения к модели: {exc}")
-                st.stop()
+                review = ""
+                llm_problem = f"ошибка основного вызова модели: {exc}"
+                st.warning(f"⚠️ Основной вызов модели не дал результата: {exc}")
 
-        # Проверяем что обзор реально сформирован (не пустая строка)
+        # Проверяем, что обзор реально сформирован. Если модель вернула пустой/короткий
+        # ответ, делаем второй вызов. Если и он не сработал — НЕ останавливаем приложение,
+        # а формируем резервный обзор по найденным источникам.
         if not review or len(review.strip()) < 300:
-            n_with_abstract = sum(1 for it in all_items if it.get("abstract","").strip())
-            if n_with_abstract == 0:
-                st.warning(
-                    "⚠️ Источники найдены, но аннотации пустые. "
-                    "Пробую сформировать обзор только по заголовкам..."
-                )
-            else:
-                st.warning("⚠️ Модель вернула слишком короткий ответ. Пробую ещё раз...")
-            # Авто-повтор: запасной промт + temperature 0.7
-            FALLBACK_PROMPT = (
-                "You are a scientific summarizer. Write a concise literature review in Russian "
-                "based strictly on the provided sources. Include specific substances, formulas, "
-                "quantities, and methods mentioned in abstracts. Use [n] citations. Structure: "
-                "## Введение / ## Обзор литературы / ## Выводы / ## Список литературы. "
-                "Even if abstracts are empty, write based on titles and authors. "
-                "NEVER return an empty or very short response. Minimum 400 words."
+            first_len = len((review or "").strip())
+            st.warning(
+                f"⚠️ Модель вернула слишком короткий ответ ({first_len} символов). "
+                "Пробую повторную генерацию с более прямым промтом…"
             )
+            FALLBACK_PROMPT = """Ты — научный аналитик. Напиши обзор литературы на русском языке строго по переданным источникам.
+
+Требования:
+- не добавляй внешние источники;
+- используй ссылки [n] только из списка;
+- если аннотация отсутствует, так и напиши: «аннотация недоступна»;
+- не возвращай пустой ответ;
+- минимальный объём — 350 слов;
+- структура: ## Введение / ## Обзор литературы / ## Выводы и направления дальнейших исследований / ## Список литературы."""
             try:
-                with st.spinner("Повторная генерация с запасным промтом..."):
+                with st.spinner("Повторная генерация с запасным промтом…"):
                     review = call_llm(
                         provider, model_id, FALLBACK_PROMPT,
                         build_user_message(topic, all_items),
-                        api_key, temperature=0.7,
+                        api_key, temperature=0.2,
                     )
             except Exception as exc:
+                llm_problem = f"ошибка повторного вызова модели: {exc}"
+                st.warning(f"⚠️ Повторный вызов модели тоже не дал результата: {exc}")
                 review = ""
+
             if not review or len(review.strip()) < 200:
-                st.error(
-                    "❌ Модель не смогла сформировать обзор.\n\n"
-                    f"Найдено источников: {len(all_items)}, с аннотацией: {n_with_abstract}.\n\n"
-                    "**Возможные причины:**\n"
-                    "- Тема слишком специфична и источники не найдены — попробуйте тему на английском\n"
-                    "- Все найденные источники отфильтрованы как нерелевантные — выберите другие базы\n"
-                    "- Gemini заблокировал запрос фильтром безопасности — попробуйте Polza.ai или другую модель"
+                final_len = len((review or "").strip())
+                reason = llm_problem or f"модель вернула только {final_len} символов"
+                st.warning(
+                    "⚠️ LLM не сформировала полноценный обзор, поэтому создан резервный "
+                    "черновик по найденным источникам. Это лучше, чем падать с ошибкой."
                 )
-                st.stop()
+                review = build_source_based_review(topic, all_items, reason=reason)
 
         st.success("Обзор готов!")
         st.markdown(review)
-
-        citations_ok, invalid_citations = validate_review_citations(review, len(all_items))
-        if not citations_ok:
-            st.warning(
-                "⚠️ В тексте обнаружены ссылки на несуществующие источники: "
-                + ", ".join(f"[{n}]" for n in invalid_citations)
-                + ". Проверьте обзор перед использованием."
-            )
 
         docx_buf = build_docx(topic, review)
         st.download_button(
@@ -1377,7 +1383,7 @@ with tab1:
 
     st.divider()
     st.caption(
-        "Демо-версия. Источники: PubMed / NCBI, Europe PMC, OpenAlex, OpenAIRE, Crossref, DOAJ, arXiv, Роспатент. "
+        "Демо-версия. Источники: PubMed / NCBI, Europe PMC, OpenAIRE, Crossref, DOAJ, arXiv, Роспатент. "
         "Полный список используемых баз и логика проверки цитирования — в промт-шаблоне проекта."
     )
 
